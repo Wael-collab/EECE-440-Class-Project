@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from Transmitter.Transmitter import Constellation, Transmitter
 from Receiver.receiver import Receiver
 from Channel.AWGNChannel import AWGN_Channel
+from Channel.RayleighChannel import Rayleigh_Channel
+from Channel.RicianChannel import Rician_Channel
 
 # 1. Generate random input bits
 rng = np.random.default_rng(7)
