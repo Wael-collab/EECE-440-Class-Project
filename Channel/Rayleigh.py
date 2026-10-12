@@ -1,6 +1,6 @@
 
 """
-@razanalkakoun
+@author: razanalkakoun
 SISO flat Rayleigh fading channel.
 Inputs:
     Data  : nonempty 1D NumPy array of complex symbols
