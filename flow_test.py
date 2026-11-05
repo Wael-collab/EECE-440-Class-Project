@@ -1,30 +1,28 @@
 import numpy as np
-import matplotlib.pyplot as plt
 
-from Transmitter.Transmitter import Constellation, Transmitter
+from Transmitter.Transmitter import Constellation, Transmitter, Waveform
 from Receiver.receiver import Receiver
 from Channel.AWGNChannel import AWGN_Channel
-from Channel.RayleighChannel import Rayleigh_Channel
-from Channel.RicianChannel import Rician_Channel
 
 # 1. Generate random input bits
 rng = np.random.default_rng(7)
-N = 4000
+N = 4096
 bits = rng.integers(0, 2, N)
 
 # 2. Configure the transmitter and receiver
 constellation = Constellation("QAM", M=16, A=4)
-tx = Transmitter(constellation)
-rx = Receiver(constellation)
+waveform = Waveform("OFDM", n_subcarriers=64, cyclic_prefix=16)
+tx = Transmitter(constellation, waveform)
+rx = Receiver(constellation, waveform)
 
 # 3. Transmit: bits -> QAM symbols
-symbols_tx = tx.run(bits, N)
+waveform_tx = tx.run(bits, N)
 
 print("Number of input bits:", len(bits))
-print("Number of transmitted symbols:", len(symbols_tx))
+print("Number of transmitted waveform samples:", len(waveform_tx))
 
 # 4. TEST 1: No noise
-bits_rx_clean = rx.decode(symbols_tx)
+bits_rx_clean = rx.decode(waveform_tx)
 ber_clean = rx.ber(bits, bits_rx_clean)
 
 print("\n--- ------------------------------------------------------------------ ---")
@@ -33,6 +31,7 @@ print("\n--- ------------------------------------------------------------------ 
 print("\n--- Noiseless test ---")
 print("BER:", ber_clean)
 print("All bits recovered correctly:", np.array_equal(bits, bits_rx_clean))
+assert np.array_equal(bits, bits_rx_clean), "Noiseless waveform round trip failed."
 
 # 5. TEST 2: Add AWGN noise
 EbN0_dB = 10
@@ -41,10 +40,10 @@ Es = constellation.A
 
 N0 = (Es / k) / (10 ** (EbN0_dB / 10))
 
-symbols_rx = AWGN_Channel(symbols_tx, N0)
+waveform_rx = AWGN_Channel(waveform_tx, N0)
 
 # 6. Receive: noisy symbols -> recovered bits
-bits_rx = rx.decode(symbols_rx)
+bits_rx = rx.decode(waveform_rx)
 
 ber = rx.ber(bits, bits_rx)
 ser = rx.ser(bits, bits_rx)
@@ -58,29 +57,35 @@ print("SER:", ser)
 print("Number of bit errors:", np.sum(bits != bits_rx))
 
 # 7. Plot the received constellation
-plt.figure(figsize=(7, 6))
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    print("Plot skipped: matplotlib is not installed.")
+else:
+    symbols_rx = rx.waveform.demodulate(waveform_rx)
+    plt.figure(figsize=(7, 6))
 
-plt.scatter(
-    constellation.table.real,
-    constellation.table.imag,
-    marker="x",
-    s=90,
-    label="Ideal QAM points"
-)
+    plt.scatter(
+        constellation.table.real,
+        constellation.table.imag,
+        marker="x",
+        s=90,
+        label="Ideal QAM points"
+    )
 
-plt.scatter(
-    symbols_rx.real,
-    symbols_rx.imag,
-    s=12,
-    alpha=0.35,
-    label="Received symbols"
-)
+    plt.scatter(
+        symbols_rx.real,
+        symbols_rx.imag,
+        s=12,
+        alpha=0.35,
+        label="Received symbols"
+    )
 
-plt.xlabel("In-phase (I)")
-plt.ylabel("Quadrature (Q)")
-plt.title(f"16-QAM received constellation, Eb/N0 = {EbN0_dB} dB")
-plt.axis("equal")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+    plt.xlabel("In-phase (I)")
+    plt.ylabel("Quadrature (Q)")
+    plt.title(f"16-QAM received constellation, Eb/N0 = {EbN0_dB} dB")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()

@@ -1,18 +1,26 @@
 import math
 import numpy as np
 
+from Transmitter.Transmitter import Waveform
+
 
 class Receiver:
     """
-    Takes the noisy received symbols and turns them back into bits.
-    Uses the same Constellation object the Transmitter used.
+    Takes received waveform samples and turns them back into bits.
+    Uses the same Constellation and Waveform configuration as the Transmitter;
+    waveform demodulation removes any cyclic prefix before symbol detection.
 
     constellation.table[i] is the symbol for the label
     format(i, "0kb"), so the table index IS the label as an integer.
     """
 
-    def __init__(self, constellation):
+    def __init__(self, constellation, waveform=None):
         self.constellation = constellation
+        if waveform is None:
+            waveform = Waveform("SC")
+        if not isinstance(waveform, Waveform):
+            raise TypeError("waveform must be a Waveform object.")
+        self.waveform = waveform
         self.k = constellation.bits_per_symbol   # bits per symbol
         self.M = constellation.M                 # number of constellation points
         self.table = np.asarray(constellation.table, dtype=complex)
@@ -27,14 +35,14 @@ class Receiver:
     # ---------- ML detector ----------
     def detect(self, y, h=None):
         """
-        Minimum-distance detection: for each received sample, pick the
+        Demodulate the waveform, then for each recovered symbol pick the
         closest constellation point. Returns symbol INDICES (0..M-1), not bits.
 
         h (optional): channel gain if we know it (coherent flat fading).
         If y = h*x + n, we just divide by h to undo the channel, then do
         the usual closest-point search. Leave h=None for plain AWGN.
         """
-        y = np.asarray(y, dtype=complex).ravel()
+        y = self.waveform.demodulate(y)
         if h is not None:
             y = y / np.asarray(h, dtype=complex)   # undo the channel
 
