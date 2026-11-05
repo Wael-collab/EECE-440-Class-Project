@@ -112,8 +112,9 @@ class Constellation:
 class Waveform:
     """Convert constellation symbols to/from a single-carrier or OFDM waveform.
 
-    A single-carrier transmission is one block; OFDM uses blocks of
-    n_subcarriers symbols. A cyclic prefix copies the end of each block.
+    With a cyclic prefix, both waveforms use blocks of n_subcarriers symbols
+    and copy the end of each block. Without a prefix, single-carrier symbols
+    pass through unchanged and n_subcarriers is ignored.
     """
 
     def __init__(self, name="SC", n_subcarriers=None, cyclic_prefix=0):
@@ -134,10 +135,14 @@ class Waveform:
                 or cyclic_prefix < 0):
             raise ValueError("cyclic_prefix must be a non-negative integer.")
         self.cyclic_prefix = int(cyclic_prefix)
-        if self.name == "OFDM":
+        if self.name == "OFDM" or self.cyclic_prefix:
             if (not isinstance(n_subcarriers, (int, np.integer))
+                    or isinstance(n_subcarriers, (bool, np.bool_))
                     or n_subcarriers <= 0):
-                raise ValueError("n_subcarriers must be a positive integer for OFDM.")
+                raise ValueError(
+                    "n_subcarriers must be a positive integer for OFDM or "
+                    "single-carrier with a cyclic prefix."
+                )
             if self.cyclic_prefix >= n_subcarriers:
                 raise ValueError("cyclic_prefix must be less than n_subcarriers.")
             self.n_subcarriers = int(n_subcarriers)
@@ -147,17 +152,19 @@ class Waveform:
         symbols = np.asarray(symbols, dtype=complex).ravel()
         if symbols.size == 0:
             raise ValueError("symbols must be non-empty.")
+        if self.name == "SC" and not self.cyclic_prefix:
+            return symbols.copy()
+
+        n = self.n_subcarriers
+        if symbols.size % n != 0:
+            raise ValueError(
+                "The number of symbols must be divisible by n_subcarriers "
+                "when using OFDM or a cyclic prefix."
+            )
+        blocks = symbols.reshape(-1, n)
         if self.name == "SC":
-            if self.cyclic_prefix > symbols.size:
-                raise ValueError("cyclic_prefix cannot exceed the number of symbols.")
-            time_blocks = symbols.reshape(1, -1)
+            time_blocks = blocks
         else:
-            n = self.n_subcarriers
-            if symbols.size % n != 0:
-                raise ValueError(
-                    "The number of symbols must be divisible by n_subcarriers for OFDM."
-                )
-            blocks = symbols.reshape(-1, n)
             time_blocks = np.fft.ifft(blocks, axis=1) * np.sqrt(n)
         if self.cyclic_prefix:
             prefix = time_blocks[:, -self.cyclic_prefix:]
@@ -169,17 +176,17 @@ class Waveform:
         samples = np.asarray(samples, dtype=complex).ravel()
         if samples.size == 0:
             raise ValueError("samples must be non-empty.")
-        if self.name == "SC":
-            if samples.size <= self.cyclic_prefix:
-                raise ValueError("Received samples must include data after the cyclic prefix.")
-            return samples[self.cyclic_prefix:].copy()
+        if self.name == "SC" and not self.cyclic_prefix:
+            return samples.copy()
 
         block_length = self.n_subcarriers + self.cyclic_prefix
         if samples.size % block_length != 0:
-            raise ValueError("The received samples must contain whole OFDM blocks.")
+            raise ValueError("The received samples must contain whole waveform blocks.")
         blocks = samples.reshape(-1, block_length)
         if self.cyclic_prefix:
             blocks = blocks[:, self.cyclic_prefix:]
+        if self.name == "SC":
+            return blocks.reshape(-1).copy()
         return (np.fft.fft(blocks, axis=1) / np.sqrt(self.n_subcarriers)).reshape(-1)
 
 
