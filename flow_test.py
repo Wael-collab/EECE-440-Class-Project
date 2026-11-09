@@ -1,86 +1,128 @@
+"""End-to-end BER/SER checks for OFDM and cyclic-prefix-free single carrier.
+
+The flat-fading channels generate one independent gain per transmitted sample.
+Single carrier equalizes after waveform demodulation; OFDM removes those
+sample-wise gains before its FFT. Both use the channel gains returned by the
+channel functions.
+"""
+
 import numpy as np
-import matplotlib.pyplot as plt
 
-from Transmitter.Transmitter import Constellation, Transmitter
-from Receiver.receiver import Receiver
 from Channel.AWGNChannel import AWGN_Channel
-from Channel.RayleighChannel import Rayleigh_Channel
+from Channel.LTapChannel import LTapChannel
+from Channel.OFDMChannel import OFDM as LegacyOFDMChannel
+from Channel.Rayleigh import Rayleigh_Channel
 from Channel.RicianChannel import Rician_Channel
+from Receiver.receiver import Receiver
+from Transmitter.Transmitter import Constellation, Transmitter, Waveform
 
-# 1. Generate random input bits
+try:
+    from Channel.AWSN import Alpha_Stable_Channel
+except ModuleNotFoundError as exc:
+    if exc.name != "aub_htp":
+        raise
+    Alpha_Stable_Channel = None
+
+
+def report(label, bits, receiver, samples, gain=None, note=""):
+    """Decode received samples and print their bit/symbol error rates."""
+    decoded = receiver.decode(samples, gain)
+    print(
+        f"  {label:<19} BER={receiver.ber(bits, decoded):.6f}  "
+        f"SER={receiver.ser(bits, decoded):.6f}  "
+        f"bit errors={np.count_nonzero(bits != decoded)}{note}"
+    )
+
+
 rng = np.random.default_rng(7)
-N = 4000
-bits = rng.integers(0, 2, N)
-
-# 2. Configure the transmitter and receiver
+np.random.seed(7)  # Existing channel functions use NumPy's global RNG.
+n_bits = 4096
+bits = rng.integers(0, 2, n_bits)
 constellation = Constellation("QAM", M=16, A=4)
-tx = Transmitter(constellation)
-rx = Receiver(constellation)
+ebn0_db = 10
+n0 = (constellation.A / constellation.bits_per_symbol) / (10 ** (ebn0_db / 10))
+l_taps = 4
 
-# 3. Transmit: bits -> QAM symbols
-symbols_tx = tx.run(bits, N)
+print(f"16-QAM, {n_bits} bits, nominal Eb/N0={ebn0_db} dB, N0={n0:.4f}")
 
-print("Number of input bits:", len(bits))
-print("Number of transmitted symbols:", len(symbols_tx))
+for name, waveform in (
+    ("OFDM + CP", Waveform("OFDM", n_subcarriers=64, cyclic_prefix=16)),
+    ("SC without CP", Waveform("SC")),
+):
+    transmitter = Transmitter(constellation, waveform)
+    receiver = Receiver(constellation, waveform)
+    transmitted = transmitter.run(bits, n_bits)
 
-# 4. TEST 1: No noise
-bits_rx_clean = rx.decode(symbols_tx)
-ber_clean = rx.ber(bits, bits_rx_clean)
+    print(f"\n{name}: {len(transmitted)} transmitted samples")
+    clean_bits = receiver.decode(transmitted)
+    assert np.array_equal(bits, clean_bits), f"{name}: noiseless round trip failed"
+    report("Noiseless", bits, receiver, transmitted)
 
-print("\n--- ------------------------------------------------------------------ ---")
+    noisy = AWGN_Channel(transmitted, n0)
+    report("AWGN", bits, receiver, noisy)
+    if waveform.name == "OFDM":
+        ofdm_awgn_symbols = waveform.demodulate(noisy)
 
+    faded, h = Rayleigh_Channel(transmitted, n0)
+    if waveform.name == "SC":
+        report("Rayleigh", bits, receiver, faded, h, " (coherent)")
+    else:
+        report("Rayleigh", bits, receiver, faded / h,
+               note=" (sample-domain coherent)")
 
-print("\n--- Noiseless test ---")
-print("BER:", ber_clean)
-print("All bits recovered correctly:", np.array_equal(bits, bits_rx_clean))
+    faded, h = Rician_Channel(transmitted, n0, K=1.0)
+    if waveform.name == "SC":
+        report("Rician", bits, receiver, faded, h, " (coherent)")
+    else:
+        report("Rician", bits, receiver, faded / h,
+               note=" (sample-domain coherent)")
 
-# 5. TEST 2: Add AWGN noise
-EbN0_dB = 10
-k = constellation.bits_per_symbol
-Es = constellation.A
+    convolved, taps = LTapChannel(l_taps, transmitted, n0)
+    convolved = convolved[:len(transmitted)]  # Drop the convolution tail.
+    if waveform.name == "OFDM":
+        # With CP >= L - 1, convolution is circular within each OFDM data block.
+        gains = np.tile(
+            np.fft.fft(taps, waveform.n_subcarriers),
+            len(transmitted) // (waveform.n_subcarriers + waveform.cyclic_prefix),
+        )
+        report("L-tap", bits, receiver, convolved, gains, " (coherent)")
+    else:
+        report("L-tap", bits, receiver, convolved, note=" (unequalized ISI)")
 
-N0 = (Es / k) / (10 ** (EbN0_dB / 10))
+    if Alpha_Stable_Channel is None:
+        print("  Alpha-stable        skipped (aub_htp is not installed)")
+    else:
+        # gamma is a noise scale, not the AWGN variance N0.
+        stable = Alpha_Stable_Channel(transmitted, alpha=1.8, gamma=0.1)
+        report("Alpha-stable", bits, receiver, stable, note=" (gamma=0.1)")
 
-symbols_rx = AWGN_Channel(symbols_tx, N0)
-
-# 6. Receive: noisy symbols -> recovered bits
-bits_rx = rx.decode(symbols_rx)
-
-ber = rx.ber(bits, bits_rx)
-ser = rx.ser(bits, bits_rx)
-
-print("\n--- ------------------------------------------------------------------ ---")
-
-print("\n--- Noisy-channel test ---")
-print("Eb/N0:", EbN0_dB, "dB")
-print("BER:", ber)
-print("SER:", ser)
-print("Number of bit errors:", np.sum(bits != bits_rx))
-
-# 7. Plot the received constellation
-plt.figure(figsize=(7, 6))
-
-plt.scatter(
-    constellation.table.real,
-    constellation.table.imag,
-    marker="x",
-    s=90,
-    label="Ideal QAM points"
+# This legacy function performs its own OFDM modulation, CP, channel and FFT;
+# passing an already-modulated waveform to it would apply OFDM twice.
+legacy_bits = bits[:64 * constellation.bits_per_symbol]
+legacy_symbols = Transmitter(constellation, Waveform("SC")).run(
+    legacy_bits, len(legacy_bits)
 )
+legacy_received, legacy_taps = LegacyOFDMChannel(legacy_symbols, l_taps, n0)
+legacy_gains = np.fft.fft(legacy_taps, len(legacy_symbols))
+print("\nLegacy OFDMChannel (standalone 64-symbol block):")
+report("OFDMChannel", legacy_bits, Receiver(constellation), legacy_received,
+       legacy_gains, " (coherent)")
 
-plt.scatter(
-    symbols_rx.real,
-    symbols_rx.imag,
-    s=12,
-    alpha=0.35,
-    label="Received symbols"
-)
-
-plt.xlabel("In-phase (I)")
-plt.ylabel("Quadrature (Q)")
-plt.title(f"16-QAM received constellation, Eb/N0 = {EbN0_dB} dB")
-plt.axis("equal")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    print("\nPlot skipped: matplotlib is not installed.")
+else:
+    plt.figure(figsize=(7, 6))
+    plt.scatter(constellation.table.real, constellation.table.imag,
+                marker="x", s=90, label="Ideal QAM points")
+    plt.scatter(ofdm_awgn_symbols.real, ofdm_awgn_symbols.imag,
+                s=12, alpha=0.35, label="OFDM + AWGN symbols")
+    plt.xlabel("In-phase (I)")
+    plt.ylabel("Quadrature (Q)")
+    plt.title(f"16-QAM received constellation, Eb/N0 = {ebn0_db} dB")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()

@@ -108,16 +108,104 @@ class Constellation:
             point = point * step             
         return mapping
 
+
+class Waveform:
+    """Convert constellation symbols to/from a single-carrier or OFDM waveform.
+
+    With a cyclic prefix, both waveforms use blocks of n_subcarriers symbols
+    and copy the end of each block. Without a prefix, single-carrier symbols
+    pass through unchanged and n_subcarriers is ignored.
+    """
+
+    def __init__(self, name="SC", n_subcarriers=None, cyclic_prefix=0):
+        aliases = {
+            "SC": "SC",
+            "SINGLE_CARRIER": "SC",
+            "SINGLE-CARRIER": "SC",
+            "OFDM": "OFDM",
+        }
+        key = str(name).upper()
+        if key not in aliases:
+            raise ValueError("Waveform must be 'SC' or 'OFDM'.")
+
+        self.name = aliases[key]
+        self.n_subcarriers = None
+        if (isinstance(cyclic_prefix, (bool, np.bool_))
+                or not isinstance(cyclic_prefix, (int, np.integer))
+                or cyclic_prefix < 0):
+            raise ValueError("cyclic_prefix must be a non-negative integer.")
+        self.cyclic_prefix = int(cyclic_prefix)
+        if self.name == "OFDM" or self.cyclic_prefix:
+            if (not isinstance(n_subcarriers, (int, np.integer))
+                    or isinstance(n_subcarriers, (bool, np.bool_))
+                    or n_subcarriers <= 0):
+                raise ValueError(
+                    "n_subcarriers must be a positive integer for OFDM or "
+                    "single-carrier with a cyclic prefix."
+                )
+            if self.cyclic_prefix >= n_subcarriers:
+                raise ValueError("cyclic_prefix must be less than n_subcarriers.")
+            self.n_subcarriers = int(n_subcarriers)
+
+    def modulate(self, symbols):
+        """Turn a 1-D symbol stream into transmit samples."""
+        symbols = np.asarray(symbols, dtype=complex).ravel()
+        if symbols.size == 0:
+            raise ValueError("symbols must be non-empty.")
+        if self.name == "SC" and not self.cyclic_prefix:
+            return symbols.copy()
+
+        n = self.n_subcarriers
+        if symbols.size % n != 0:
+            raise ValueError(
+                "The number of symbols must be divisible by n_subcarriers "
+                "when using OFDM or a cyclic prefix."
+            )
+        blocks = symbols.reshape(-1, n)
+        if self.name == "SC":
+            time_blocks = blocks
+        else:
+            time_blocks = np.fft.ifft(blocks, axis=1) * np.sqrt(n)
+        if self.cyclic_prefix:
+            prefix = time_blocks[:, -self.cyclic_prefix:]
+            time_blocks = np.concatenate((prefix, time_blocks), axis=1)
+        return time_blocks.reshape(-1)
+
+    def demodulate(self, samples):
+        """Recover constellation symbols from received waveform samples."""
+        samples = np.asarray(samples, dtype=complex).ravel()
+        if samples.size == 0:
+            raise ValueError("samples must be non-empty.")
+        if self.name == "SC" and not self.cyclic_prefix:
+            return samples.copy()
+
+        block_length = self.n_subcarriers + self.cyclic_prefix
+        if samples.size % block_length != 0:
+            raise ValueError("The received samples must contain whole waveform blocks.")
+        blocks = samples.reshape(-1, block_length)
+        if self.cyclic_prefix:
+            blocks = blocks[:, self.cyclic_prefix:]
+        if self.name == "SC":
+            return blocks.reshape(-1).copy()
+        return (np.fft.fft(blocks, axis=1) / np.sqrt(self.n_subcarriers)).reshape(-1)
+
+
 class Transmitter:
-    def __init__(self, constellation):
+    def __init__(self, constellation, waveform=None):
         """
         constellation : a Constellation object (already normalized and
                         scaled to its energy A).
+        waveform : a Waveform object. Defaults to single-carrier transmission.
         """
         if not isinstance(constellation, Constellation):
             raise TypeError("constellation must be a Constellation object.")
+        if waveform is None:
+            waveform = Waveform("SC")
+        if not isinstance(waveform, Waveform):
+            raise TypeError("waveform must be a Waveform object.")
 
         self.constellation = constellation
+        self.waveform = waveform
         self.k = constellation.bits_per_symbol
         self.M = constellation.M
     
@@ -155,15 +243,16 @@ class Transmitter:
             label = "".join(str(b) for b in chunk)        
             symbols.append(self.constellation.mapping[label])
 
-        return np.array(symbols)
+        return self.waveform.modulate(np.array(symbols))
 
-N = 64   
-bits = np.random.randint(0, 2, N)
-print("bits:", bits)
+if __name__ == "__main__":
+    N = 64
+    bits = np.random.randint(0, 2, N)
+    print("bits:", bits)
 
-for name in ["PAM", "QAM", "PSK"]:
-    c = Constellation(name, M=16,A=4)
-    tx = Transmitter(c)
-    symbols = tx.run(bits, N)
-    print(bits)
-    print(symbols)
+    for name in ["PAM", "QAM", "PSK"]:
+        c = Constellation(name, M=16, A=4)
+        tx = Transmitter(c)
+        samples = tx.run(bits, N)
+        print(bits)
+        print(samples)
