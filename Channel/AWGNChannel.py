@@ -20,9 +20,13 @@ def AWGN_Channel(Data,Nzero):
 
 """
 #Sample usage
+# SISO
 Data=np.zeros(10000,dtype=complex)
+
+# MIMO: Nt transmit antennas, Nr receive antennas, N symbols
+# Data=np.zeros((Nr,10000),dtype=complex)
+
 Nzero=0.5
 response=AWGN_Channel(Data, Nzero)
 print(response)
 """
-
