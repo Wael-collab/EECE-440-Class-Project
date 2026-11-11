@@ -12,7 +12,10 @@ class Receiver:
 
     Besides the SISO detector it has the MIMO receivers matching Coding_Schemes
     (Y = H X + N, X of shape (n_tx, T)): scalar/MIMO ZF and MMSE, ordered SIC
-    (V-BLAST), Alamouti combining and pilot-based channel estimation.
+    (V-BLAST), Alamouti combining and pilot-based channel estimation, plus
+    non-coherent detection that needs neither the channel nor pilots:
+    differential (DPSK, differential Alamouti), energy detection (OOK /
+    amplitude levels) and orthogonal M-FSK.
 
     constellation.table[i] is the symbol for the label
     format(i, "0kb"), so the table index IS the label as an integer.
@@ -316,6 +319,165 @@ class Receiver:
         B = Yp @ Xp.conj().T
         return np.linalg.solve(A.T, B.T).T               # B A^-1
 
+    # ---------- non-coherent detection (no channel knowledge, no pilots) ----------
+    def _require_psk(self):
+        """Differential schemes carry the data in the phase, so the constellation must be constant-modulus."""
+        mags = np.abs(self.table)
+        if not np.allclose(mags, mags[0]):
+            raise ValueError(
+                "Differential (non-coherent) detection needs a constant-modulus "
+                "constellation such as PSK; this one has points of different magnitude."
+            )
+
+    def _slice_phase(self, z):
+        """Closest constellation point by phase: argmax Re(conj(table) * z). Safe when z = 0."""
+        z = np.asarray(z, dtype=complex)
+        return np.argmax(np.real(np.conj(self.table) * z[..., None]), axis=-1)
+
+    def differential_detect(self, y):
+        """
+        Differential (DPSK) detection for a transmitter that used differential_encode().
+
+        y : (T+1,) received samples, or (Nr, T+1) for Nr receive antennas. The
+            first sample is the reference. The detector never sees h or N0: with a
+            channel that is constant over two consecutive samples,
+
+                y_t * conj(y_{t-1}) = |h|^2 * sqrt(A) * s_t + noise,
+
+        so the phase of the product gives the symbol. With several receive
+        antennas the products are summed over the antennas (receive diversity)
+        before slicing. Returns T symbol indices (not bits).
+
+        The fading must stay (almost) constant between neighbouring samples,
+        e.g. MIMOLTapChannel with L = 1. It does not work with Rayleigh_Channel,
+        which draws a new gain for every sample.
+        """
+        self._require_psk()
+        y = np.atleast_2d(np.asarray(y, dtype=complex))
+        y = np.vstack([self.waveform.demodulate(row) for row in y])
+        if y.shape[1] < 2:
+            raise ValueError("Need the reference sample plus at least one data sample.")
+        z = np.sum(y[:, 1:] * np.conj(y[:, :-1]), axis=0)
+        return self._slice_phase(z)
+
+    def decode_differential(self, y):
+        """Differential detection followed by the bit lookup. Returns a 1-D bit array."""
+        return self.bit_table[self.differential_detect(y)].ravel()
+
+    def differential_alamouti_detect(self, Y):
+        """
+        Non-coherent detection for 2 transmit antennas, for a transmitter that used
+        differential_alamouti_encode() (Tarokh-Jafarkhani differential STBC).
+
+        Y : (Nr, 2*(P+1)) received matrix, first block = reference. Block t obeys
+        Y_t = Y_{t-1} B(s1, s2) + noise, where B = [[s1, -s2*], [s2, s1*]], so the
+        pair (s1, s2) is found from two consecutive blocks without knowing H:
+
+            s1_hat = sum_r [conj(p1) q1 + p2 conj(q2)] / E
+            s2_hat = sum_r [conj(p2) q1 - p1 conj(q2)] / E
+
+        with p1, p2 the two columns of the previous block, q1, q2 the current ones
+        and E = sum_r (|p1|^2 + |p2|^2). This is Alamouti combining where the
+        previous block plays the role of the channel. Returns 2P symbol indices.
+        """
+        self._require_psk()
+        Y = np.atleast_2d(np.asarray(Y, dtype=complex))
+        Y = np.vstack([self.waveform.demodulate(row) for row in Y])
+        if Y.shape[1] % 2 != 0 or Y.shape[1] < 4:
+            raise ValueError("Y needs an even number of columns: reference block plus at least one data block.")
+
+        c1, c2 = Y[:, 0::2], Y[:, 1::2]                 # first / second column of every block
+        p1, p2, q1, q2 = c1[:, :-1], c2[:, :-1], c1[:, 1:], c2[:, 1:]
+        E = np.maximum(np.sum(np.abs(p1) ** 2 + np.abs(p2) ** 2, axis=0), 1e-300)
+        s1 = np.sum(np.conj(p1) * q1 + p2 * np.conj(q2), axis=0) / E
+        s2 = np.sum(np.conj(p2) * q1 - p1 * np.conj(q2), axis=0) / E
+
+        # s_i = a_i / sqrt(2) with a_i a unit-modulus PSK point; bring back to the constellation scale
+        scale = np.sqrt(2 * self.constellation.A)
+        idx = np.empty(2 * s1.size, dtype=int)
+        idx[0::2] = self._slice_phase(scale * s1)
+        idx[1::2] = self._slice_phase(scale * s2)
+        return idx
+
+    def decode_differential_alamouti(self, Y):
+        """Differential Alamouti detection followed by the bit lookup. Returns a 1-D bit array."""
+        return self.bit_table[self.differential_alamouti_detect(Y)].ravel()
+
+    # ---------- non-coherent: energy detection (OOK / amplitude constellations) ----------
+    def energy_detect(self, y, N0=None, fading_var=1.0):
+        """
+        Energy (envelope) detector for constellations whose points differ in
+        MAGNITUDE only, e.g. OOK = Constellation("OOK", mapping={"0": 0, "1": 1}) or
+        several amplitude levels. The phase is never used, so no channel phase,
+        no pilots and no h are needed, and it also works with the per-sample
+        gains of Rayleigh_Channel.
+
+        y : (T,) or (Nr, T) received samples. The energy is summed over the Nr antennas.
+
+        fading_var = E|h|^2 (default 1, Rayleigh like the project channels), N0 required:
+            the energy under symbol i is exponential (Gamma with Nr terms) with mean
+            m_i = N0 + fading_var*|s_i|^2, so the ML rule picks the i that maximises
+            -Nr*ln(m_i) - E/m_i  (for OOK this is a single threshold on E).
+        fading_var=None (plain AWGN, h = 1): pick the level whose energy |s_i|^2 + N0
+            is closest to the measured average energy; N0 is not needed.
+
+        Caveat: with fading the gain scales the energy, so a constellation with more than
+        two levels gets confused even without noise. Use OOK under fading; amplitude
+        levels (ASK) are only reliable on AWGN (fading_var=None).
+
+        Returns symbol indices (not bits). Raises ValueError if two constellation
+        points share the same magnitude (e.g. PAM/PSK/QAM symmetric points).
+        """
+        levels = np.abs(self.table) ** 2
+        if len(np.unique(np.round(levels, 12))) != self.M:
+            raise ValueError(
+                "Energy detection needs every constellation point to have a different "
+                "magnitude (e.g. OOK or amplitude levels); this constellation does not."
+            )
+        y = np.atleast_2d(np.asarray(y, dtype=complex))
+        y = np.vstack([self.waveform.demodulate(row) for row in y])
+        Nr = y.shape[0]
+        E = np.sum(np.abs(y) ** 2, axis=0)                       # (T,)
+
+        if fading_var is None:
+            n0 = 0.0 if N0 is None else N0
+            return np.argmin(np.abs(E[:, None] / Nr - (levels[None, :] + n0)), axis=1)
+
+        if N0 is None or N0 <= 0:
+            raise ValueError("Fading ML energy detection needs N0 > 0.")
+        if fading_var <= 0:
+            raise ValueError("fading_var must be positive (or None for plain AWGN).")
+        m = N0 + fading_var * levels                              # (M,)
+        return np.argmax(-Nr * np.log(m)[None, :] - E[:, None] / m[None, :], axis=1)
+
+    def decode_energy(self, y, N0=None, fading_var=1.0):
+        """Energy detection followed by the bit lookup. Returns a 1-D bit array."""
+        return self.bit_table[self.energy_detect(y, N0, fading_var)].ravel()
+
+    # ---------- non-coherent: orthogonal M-FSK ----------
+    def fsk_detect(self, Y):
+        """
+        Non-coherent detection of orthogonal M-FSK (M = constellation.M tones; the
+        symbol index is the tone index, the constellation points themselves are not used).
+
+        Y : (M, T) correlator outputs, row m = tone m, or (Nr, M, T) for Nr receive
+        antennas. In every branch y_m = h*x_m + n_m with x_m = sqrt(A) for the sent
+        tone and 0 otherwise, so the phase of h is irrelevant: pick the tone with the
+        largest energy |y_m|^2 (summed over antennas). This is the ML rule for
+        Rayleigh fading and for AWGN with unknown phase, and needs neither h nor N0.
+        Returns T symbol indices.
+        """
+        Y = np.asarray(Y, dtype=complex)
+        if Y.ndim == 2:
+            Y = Y[None]
+        if Y.ndim != 3 or Y.shape[1] != self.M:
+            raise ValueError("Y must have shape (M, T) or (Nr, M, T) with M = constellation.M tones.")
+        return np.argmax(np.sum(np.abs(Y) ** 2, axis=0), axis=0)
+
+    def decode_fsk(self, Y):
+        """Non-coherent FSK detection followed by the bit lookup. Returns a 1-D bit array."""
+        return self.bit_table[self.fsk_detect(Y)].ravel()
+
     # ---------- helpers ----------
     def bits_to_indices(self, bits):
         """Group bits into chunks of k and turn each chunk into an integer (the symbol index)."""
@@ -359,6 +521,83 @@ def pilot_matrix(n_tx, n_pilots=None, Es=1.0, power_split=True):
     t, k = np.arange(n_tx)[:, None], np.arange(n_pilots)[None, :]
     P = np.exp(-2j * np.pi * t * k / n_pilots)
     return P * np.sqrt(Es / n_tx) if power_split else P * np.sqrt(Es)
+
+
+def differential_encode(symbols, A=1.0):
+    """
+    Differential PSK encoder (transmit side of Receiver.differential_detect).
+
+    symbols : constant-modulus constellation symbols (|s|^2 = A, e.g. PSK from
+              Transmitter.run with the SC waveform and no cyclic prefix).
+    Returns T+1 symbols: a reference sqrt(A) followed by d_t = d_{t-1} * s_t / sqrt(A),
+    i.e. the information is in the phase change between neighbouring samples.
+    Feed the result to the channel like ordinary symbols.
+    """
+    s = np.asarray(symbols, dtype=complex).ravel()
+    if A <= 0:
+        raise ValueError("A must be positive.")
+    if not np.allclose(np.abs(s) ** 2, A):
+        raise ValueError("Differential encoding needs constant-modulus symbols with |s|^2 = A (PSK).")
+    d = np.empty(s.size + 1, dtype=complex)
+    d[0] = np.sqrt(A)
+    d[1:] = np.sqrt(A) * np.exp(1j * np.cumsum(np.angle(s)))
+    return d
+
+
+def differential_alamouti_encode(symbols, Es=1.0, power_split=True):
+    """
+    Differential Alamouti encoder (transmit side of
+    Receiver.differential_alamouti_detect). Two antennas, shape (2, 2*(P+1)).
+
+    symbols : 2P constant-modulus PSK symbols with |s|^2 = Es, taken in pairs (u1, u2).
+    Each pair becomes s = (u1, u2) / sqrt(2*Es), and the transmitted blocks are
+    X_t = scale * U_t with U_t = U_{t-1} * [[s1, -s2*], [s2, s1*]]. The first block
+    is a fixed unitary reference. U_t stays unitary, so every channel use carries
+    energy Es in total (power_split=True, like CodingScheme) or Es per antenna
+    (power_split=False).
+    """
+    u = np.asarray(symbols, dtype=complex).ravel()
+    if Es <= 0:
+        raise ValueError("Es must be positive.")
+    if u.size == 0 or u.size % 2 != 0:
+        raise ValueError("Need a non-empty even number of symbols.")
+    if not np.allclose(np.abs(u) ** 2, Es):
+        raise ValueError("Differential Alamouti needs constant-modulus symbols with |s|^2 = Es (PSK).")
+
+    a = u / np.sqrt(Es) / np.sqrt(2)                      # |a1|^2 + |a2|^2 = 1
+    P = a.size // 2
+    r = 1 / np.sqrt(2)
+    U = np.array([[r, -r], [r, r]], dtype=complex)        # reference block (Alamouti form, unitary)
+    scale = np.sqrt(Es) if power_split else np.sqrt(2 * Es)
+    X = np.empty((2, 2 * (P + 1)), dtype=complex)
+    X[:, 0:2] = scale * U
+    for p in range(P):
+        s1, s2 = a[2 * p], a[2 * p + 1]
+        U = U @ np.array([[s1, -np.conj(s2)], [s2, np.conj(s1)]])
+        X[:, 2 * (p + 1):2 * (p + 1) + 2] = scale * U
+    return X
+
+
+def fsk_encode(indices, M, Es=1.0):
+    """
+    Orthogonal M-FSK in the correlator domain (transmit side of Receiver.fsk_detect).
+
+    indices : symbol indices 0..M-1, e.g. Receiver.bits_to_indices(bits).
+    Returns an (M, T) matrix with sqrt(Es) in row indices[t] of column t and 0
+    elsewhere: one tone per channel use, Es energy per symbol. Pass every row
+    through the SAME channel gain (h*X + noise), since all tones share one fading
+    coefficient; use Nr of them for receive diversity.
+    """
+    idx = np.asarray(indices, dtype=int).ravel()
+    if M < 2 or (M & (M - 1)) != 0:
+        raise ValueError("M must be a power of 2.")
+    if Es <= 0:
+        raise ValueError("Es must be positive.")
+    if idx.size == 0 or idx.min() < 0 or idx.max() >= M:
+        raise ValueError("indices must be a non-empty array of integers in 0..M-1.")
+    X = np.zeros((M, idx.size), dtype=complex)
+    X[idx, np.arange(idx.size)] = np.sqrt(Es)
+    return X
 
 
 def qfunc(x):
@@ -417,4 +656,3 @@ def monte_carlo(constellation, channel, EbN0_dB, n_bits=100_000, n_trials=20, se
         out["ser_var"].append(np.var(sers, ddof=1))
 
     return {key: np.array(v) for key, v in out.items()}
-
