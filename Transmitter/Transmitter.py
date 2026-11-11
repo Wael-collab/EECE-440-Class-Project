@@ -2,14 +2,14 @@ import numpy as np
 import math
 
 class Constellation:
-    def __init__(self, name, M=None, d=1.0, mapping=None, A=1):
+    def __init__(self, name, M=None, mapping=None, A=1):
 
         self.name = name
 
         if name.upper() == "PAM":
-            mapping = self._build_pam(M, d)
+            mapping = self._build_pam(M)
         elif name.upper() == "QAM":
-            mapping = self._build_qam(M, d)
+            mapping = self._build_qam(M)
         elif name.upper() == "PSK":
             mapping = self._build_psk(M)
         else:
@@ -57,12 +57,10 @@ class Constellation:
         self.table = table
         self.mapping = {l: self.table[int(l, 2)] for l in mapping}
         
-    def _build_pam(self, M, d):
+    def _build_pam(self, M):
         #This checks if M<2 and if M is not a power of two, in this case report an error.
         if M is None or M < 2 or (M & (M - 1)) != 0:
             raise ValueError("M-PAM requires M to be a power of 2.")
-        if d <= 0:
-            raise ValueError("d must be positive.")
         k = int(np.log2(M))
         mapping = {}
         for m in range(M):
@@ -70,10 +68,10 @@ class Constellation:
             gray = m ^ (m >> 1) 
             #This pads zeros so that all the binary strings will have the same length                     
             label = format(gray, f"0{k}b")           
-            mapping[label] = d * (2 * m - (M - 1)) / 2
+            mapping[label] = 2 * m - (M - 1) 
         return mapping
 
-    def _build_qam(self, M, d):
+    def _build_qam(self, M):
         #This checks if M<2 and if M is not a power of two, in this case report an error.
         if M is None or M < 4 or (M & (M - 1)) != 0:
             raise ValueError("M-QAM requires M to be a power of 2.")
@@ -82,7 +80,7 @@ class Constellation:
         if L * L != M:
             raise ValueError("M-QAM requires M to be a perfect square.")
 
-        pam = self._build_pam(L, d)     
+        pam = self._build_pam(L)     
 
         mapping = {}
         for label_i, x_i in pam.items():
@@ -227,7 +225,6 @@ class Transmitter:
             raise ValueError(f"Expected {N} bits, got {len(bits)}.")
 
         return self.modulate(bits)
-
     def modulate(self, bits):
         bits = np.asarray(bits, dtype=int).ravel()
 
@@ -237,13 +234,12 @@ class Transmitter:
             raise ValueError(f"Number of bits ({len(bits)}) must be a "
                             f"multiple of {self.k}.")
 
-        symbols = []
-        for i in range(0, len(bits), self.k):
-            chunk = bits[i:i + self.k]                    
-            label = "".join(str(b) for b in chunk)        
-            symbols.append(self.constellation.mapping[label])
+        # Each row is one k-bit label (MSB first); convert rows to table indices
+        weights = 1 << np.arange(self.k - 1, -1, -1)
+        idx = bits.reshape(-1, self.k) @ weights
+        symbols = self.constellation.table[idx]
 
-        return self.waveform.modulate(np.array(symbols))
+        return self.waveform.modulate(symbols)
 
 if __name__ == "__main__":
     N = 64
