@@ -780,10 +780,7 @@ def fading_popup(channel):
         "own SIMO channel realization. The final BER is total bit "
         "errors divided by total transmitted/tested bits."
     )
-    st.checkbox(
-        "Coherent Detection (Perfect Channel Knowledge)",
-        value=True, key=f"{prefix}coherent",
-    )
+    st.info("Detection mode: Coherent Detection (Perfect Channel Knowledge).")
 
     if st.button(f"Start {channel} Simulation"):
         k = int(np.log2(M))
