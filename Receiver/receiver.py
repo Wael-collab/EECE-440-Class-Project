@@ -28,12 +28,10 @@ class Receiver:
         if not isinstance(waveform, Waveform):
             raise TypeError("waveform must be a Waveform object.")
         self.waveform = waveform
-        self.k = constellation.bits_per_symbol   # bits per symbol
-        self.M = constellation.M                 # number of constellation points
+        self.k = constellation.bits_per_symbol
+        self.M = constellation.M
         self.table = np.asarray(constellation.table, dtype=complex)
 
-        # Lookup table: symbol index -> its k bits (MSB first). Shape (M, k).
-        # e.g. for 4 points: 0 -> [0,0], 1 -> [0,1], 2 -> [1,0], 3 -> [1,1]
         self.bit_table = np.array(
             [[(i >> (self.k - 1 - j)) & 1 for j in range(self.k)] for i in range(self.M)],
             dtype=int,
@@ -43,33 +41,25 @@ class Receiver:
     def _slice(self, s):
         """Minimum-distance slicer: closest constellation index for every entry of s (any shape)."""
         s = np.asarray(s, dtype=complex)
-        d2 = np.abs(s[..., None] - self.table) ** 2     # (..., M)
+        d2 = np.abs(s[..., None] - self.table) ** 2
         return np.argmin(d2, axis=-1)
 
     def detect(self, y, h=None, N0=None):
         """
         Demodulate the waveform, then for each recovered symbol pick the
-        closest constellation point. Returns symbol INDICES (0..M-1), not bits.
-
-        h (optional): channel gain if we know it (coherent flat fading).
-        If y = h*x + n, we just divide by h to undo the channel (zero forcing),
-        then do the usual closest-point search. Leave h=None for plain AWGN.
-
-        N0 (optional): noise variance. If both h and N0 are given, the scalar
-        MMSE equalizer is used instead of zero forcing.
+        closest constellation point.
         """
         y = self.waveform.demodulate(y)
         if h is not None:
             if N0 is None:
-                y = y / np.asarray(h, dtype=complex)    # zero forcing: undo the channel
+                y = y / np.asarray(h, dtype=complex)
             else:
                 y = self.mmse_equalize(y, h, N0, unbiased=True)
         return self._slice(y)
 
     # ---------- Lookup-table decoder ----------
     def decode(self, y, h=None, N0=None):
-        """Detect the symbols, then look up their bits. Returns a 1-D bit array.
-        Pass N0 together with h to use the scalar MMSE equalizer instead of ZF."""
+        """Detect the symbols, then look up their bits. Returns a 1-D bit array."""
         idx = self.detect(y, h, N0)
         return self.bit_table[idx].ravel()
 
@@ -80,19 +70,7 @@ class Receiver:
 
     def mmse_equalize(self, y, h, N0, unbiased=False):
         """
-        Scalar MMSE equalizer for y = h*x + n, with E|x|^2 = Es = constellation.A
-        and n ~ CN(0, N0) (same N0 as the channel functions):
-
-            x_hat = conj(h) / (|h|^2 + N0/Es) * y
-
-        y and h can be any matching shapes, per-symbol or per-sample gains
-        (e.g. the h returned by Rayleigh_Channel / Rician_Channel), and y can be
-        symbols or time-domain samples.
-
-        The textbook MMSE output is shrunk towards 0 (biased). unbiased=True
-        rescales by |h|^2 / (|h|^2 + N0/Es) so the output is centred on the
-        constellation points, which is what the minimum-distance slicer needs
-        for QAM. detect(y, h, N0) uses the unbiased version.
+        Scalar MMSE equalizer for y = h*x + n, with E|x|^2 = Es = constellation.A.
         """
         if N0 < 0:
             raise ValueError("N0 must be non-negative.")
@@ -104,18 +82,147 @@ class Receiver:
             x_hat = x_hat * (g + N0 / self.constellation.A) / g
         return x_hat
 
+    # ---------- SIMO diversity combining ----------
+
+    def _simo_inputs(self, Y, H):
+        """
+        Prepare received signals and channel gains for SIMO combining.
+
+        Y: (Nr, T) received signals.
+        H: (Nr,) constant channel gains or (Nr, T) time-varying gains.
+
+        Each received branch is passed through the waveform demodulator.
+        """
+        Y = np.asarray(Y, dtype=complex)
+        H = np.asarray(H, dtype=complex)
+
+        if Y.ndim == 1:
+            Y = Y[None, :]
+
+        if H.ndim == 1:
+            H = H[:, None]
+
+        if Y.ndim != 2 or H.ndim != 2:
+            raise ValueError("Y and H must be 1-D or 2-D arrays.")
+
+        if Y.shape[0] != H.shape[0]:
+            raise ValueError("Y and H must have the same number of receive antennas.")
+
+        if H.shape[1] not in (1, Y.shape[1]):
+            raise ValueError("H must have either one column or T columns.")
+
+        Y = np.vstack([self.waveform.demodulate(row) for row in Y])
+
+        return Y, H
+
+    # ---------- Maximum Ratio Combining (MRC) ----------
+
+    def mrc_combine(self, Y, H):
+        """
+        Maximum Ratio Combining for SIMO.
+
+        System model:
+            y_r = h_r*x + n_r
+
+        MRC formula:
+            x_hat = sum(conj(h_r)*y_r) / sum(|h_r|^2)
+
+        Y: (Nr, T) received signals.
+        H: (Nr,) or (Nr, T) channel gains.
+
+        Returns:
+            Combined symbol estimates of shape (T,).
+        """
+        Y, H = self._simo_inputs(Y, H)
+
+        numerator = np.sum(np.conj(H) * Y, axis=0)
+        denominator = np.sum(np.abs(H) ** 2, axis=0)
+
+        return numerator / np.maximum(denominator, 1e-300)
+
+    def decode_mrc(self, Y, H):
+        """MRC combining followed by symbol detection and bit decoding."""
+        combined = self.mrc_combine(Y, H)
+        return self.bit_table[self._slice(combined)].ravel()
+
+    # ---------- Equal Gain Combining (EGC) ----------
+
+    def egc_combine(self, Y, H):
+        """
+        Equal Gain Combining for SIMO.
+
+        Each branch is phase-aligned using its channel estimate, then
+        the aligned signals are combined with equal weights.
+
+        Formula:
+            x_hat = sum((conj(h_r)/|h_r|)*y_r) / sum(|h_r|)
+
+        Y: (Nr, T) received signals.
+        H: (Nr,) or (Nr, T) channel gains.
+
+        Returns:
+            Combined symbol estimates of shape (T,).
+        """
+        Y, H = self._simo_inputs(Y, H)
+
+        magnitudes = np.abs(H)
+        phase_weights = np.conj(H) / np.maximum(magnitudes, 1e-300)
+
+        numerator = np.sum(phase_weights * Y, axis=0)
+        denominator = np.sum(magnitudes, axis=0)
+
+        return numerator / np.maximum(denominator, 1e-300)
+
+    def decode_egc(self, Y, H):
+        """EGC combining followed by symbol detection and bit decoding."""
+        combined = self.egc_combine(Y, H)
+        return self.bit_table[self._slice(combined)].ravel()
+
+    # ---------- Selection Combining (SC) ----------
+
+    def selection_combine(self, Y, H):
+        """
+        Selection Combining for SIMO.
+
+        Selects the receive antenna with the highest instantaneous
+        channel gain for each symbol.
+
+        Selection rule:
+            r_best = argmax(|h_r|^2)
+
+        Equalization:
+            x_hat = y_best / h_best
+
+        Y: (Nr, T) received signals.
+        H: (Nr,) or (Nr, T) channel gains.
+
+        Returns:
+            Combined symbol estimates of shape (T,).
+        """
+        Y, H = self._simo_inputs(Y, H)
+
+        best_branch = np.argmax(np.abs(H) ** 2, axis=0)
+
+        columns = np.arange(Y.shape[1])
+
+        selected_y = Y[best_branch, columns]
+        selected_h = H[best_branch, columns]
+
+        return selected_y / np.where(
+            np.abs(selected_h) > 0,
+            selected_h,
+            1.0
+        )
+
+    def decode_selection(self, Y, H):
+        """Selection combining followed by symbol detection and bit decoding."""
+        combined = self.selection_combine(Y, H)
+        return self.bit_table[self._slice(combined)].ravel()
+
     # ---------- MIMO helpers ----------
     def _mimo_inputs(self, Y, H, power_split):
         """
         Check shapes and return (Y, H_eff) for a flat MIMO channel Y = H X + N.
-
-        Y : (Nr, T) received matrix (a 1-D array is treated as Nr = 1). Each row
-            goes through the waveform demodulator (a no-op for plain SC).
-        H : (Nr, Nt) or (Nr, Nt, 1), e.g. the h returned by MIMOLTapChannel with
-            L = 1. The channel must be constant over the block, as in
-            MIMOLTapChannel, so it commutes with the CP removal and FFT.
-        power_split : must match the CodingScheme. If the transmitter scaled X
-            by 1/sqrt(n_tx), the channel the symbols actually see is H/sqrt(n_tx).
         """
         Y = np.atleast_2d(np.asarray(Y, dtype=complex))
         H = np.asarray(H, dtype=complex)
@@ -142,8 +249,7 @@ class Receiver:
     # ---------- MIMO zero forcing ----------
     def zf_mimo(self, Y, H, power_split=True):
         """
-        MIMO zero-forcing detection: S_hat = pinv(H) Y = (H^H H)^-1 H^H Y.
-        Needs Nr >= Nt. Returns the (Nt, T) symbol estimates (before slicing).
+        MIMO zero-forcing detection.
         """
         Y, H = self._mimo_inputs(Y, H, power_split)
         if H.shape[0] < H.shape[1]:
@@ -153,12 +259,7 @@ class Receiver:
     # ---------- MIMO MMSE ----------
     def mmse_mimo(self, Y, H, N0, power_split=True, unbiased=False):
         """
-        MIMO MMSE detection:  S_hat = (H^H H + (N0/Es) I)^-1 H^H Y,
-        with Es = constellation.A and N0 the per-receive-antenna noise variance.
-        Works for any Nr, including Nr < Nt. Returns the (Nt, T) estimates.
-
-        unbiased=True divides each layer by the diagonal of W H (its gain on its
-        own symbol) so the outputs are centred on the constellation points.
+        MIMO MMSE detection.
         """
         if N0 < 0:
             raise ValueError("N0 must be non-negative.")
@@ -175,21 +276,6 @@ class Receiver:
     def sic_vblast(self, Y, H, N0=None, power_split=True, ordered=True):
         """
         Ordered successive interference cancellation (V-BLAST detection).
-
-        Repeat Nt times: (1) build the nulling filters for the layers that are
-        left, (2) pick the layer with the smallest error (best post-detection
-        SNR) when ordered=True, else just the next one, (3) estimate it and
-        slice it to the nearest constellation point, (4) subtract its
-        contribution H[:, j] * s_j from Y and drop that column from H.
-
-        N0=None  -> zero-forcing nulling (needs Nr >= Nt).
-        N0 given -> MMSE nulling (unbiased before slicing).
-
-        Because H is constant over the block, the detection order is the same
-        for every channel use, so everything is vectorized over the T columns.
-
-        Returns (idx, order): idx is (Nt, T) symbol indices in the original
-        antenna order, order is the list of layers in the order they were detected.
         """
         Y, H = self._mimo_inputs(Y, H, power_split)
         Nr, Nt = H.shape
@@ -206,15 +292,13 @@ class Receiver:
             Hk = H[:, remaining]
             Hh = Hk.conj().T
             G = np.linalg.inv(Hh @ Hk + reg * np.eye(len(remaining)))
-            W = G @ Hh                                   # nulling filters, one row per layer
+            W = G @ Hh
             pick = int(np.argmin(np.real(np.diag(G)))) if ordered else 0
             layer = remaining[pick]
 
-            # estimate, remove the bias, slice
             s_hat = (W[pick] @ Yk) / (W[pick] @ Hk[:, pick])
             idx[layer] = self._slice(s_hat)
 
-            # cancel this layer from the received vector
             Yk = Yk - np.outer(H[:, layer], self.table[idx[layer]])
             remaining.pop(pick)
             order.append(layer)
@@ -224,20 +308,7 @@ class Receiver:
     # ---------- Alamouti combining ----------
     def alamouti_combine(self, Y, H, N0=None, power_split=True):
         """
-        Alamouti combining for the 2-antenna code in Coding_Schemes.Alamouti
-        (antenna 1: u1, -u2*; antenna 2: u2, u1*), with Nr receive antennas.
-
-            z1 = sum_r [ conj(h_r1) y_r1 + h_r2 conj(y_r2) ]
-            z2 = sum_r [ conj(h_r2) y_r1 - h_r1 conj(y_r2) ]
-            g  = sum_r (|h_r1|^2 + |h_r2|^2)
-
-        y_r1, y_r2 are the two consecutive channel uses of receive antenna r.
-        Then u_hat = z / g (zero forcing) or z / (g + N0/Es) (scalar MMSE) when
-        N0 is given (unbiased MMSE is identical to z / g, so for slicing both
-        give the same decisions; the MMSE form matters for the shrunk output).
-
-        H is (Nr, 2), constant over the block. Returns the length-T symbol
-        stream u1, u2, u3, u4, ... ready for slicing.
+        Alamouti combining for the 2-antenna code in Coding_Schemes.Alamouti.
         """
         Y, H = self._mimo_inputs(Y, H, power_split)
         if H.shape[1] != 2:
@@ -246,7 +317,7 @@ class Receiver:
             raise ValueError("Alamouti needs an even number of channel uses.")
 
         y1, y2 = Y[:, 0::2], Y[:, 1::2]
-        h1, h2 = H[:, [0]], H[:, [1]]                    # (Nr, 1)
+        h1, h2 = H[:, [0]], H[:, [1]]
         z1 = np.sum(np.conj(h1) * y1 + h2 * np.conj(y2), axis=0)
         z2 = np.sum(np.conj(h2) * y1 - h1 * np.conj(y2), axis=0)
         g = np.sum(np.abs(H) ** 2)
@@ -263,7 +334,6 @@ class Receiver:
     def decode_mimo(self, Y, H, method="mmse", N0=None, power_split=True):
         """
         Detect a V-BLAST transmission and return the bit stream.
-        method: "zf", "mmse" (needs N0) or "sic" (MMSE-SIC if N0 is given, else ZF-SIC).
         """
         method = method.lower()
         if method == "zf":
@@ -285,23 +355,12 @@ class Receiver:
 
     # ---------- pilot-based channel estimation ----------
     def pilots(self, n_tx, n_pilots=None, power_split=True):
-        """Pilot matrix (n_tx, n_pilots) with the same energy rules as the data; see pilot_matrix()."""
+        """Pilot matrix with the same energy rules as the transmitter."""
         return pilot_matrix(n_tx, n_pilots, self.constellation.A, power_split)
 
     def estimate_channel(self, Yp, Xp, N0=None, prior_var=1.0):
         """
         Estimate the flat MIMO channel from known pilots, Yp = H Xp + N.
-
-        Yp : (Nr, Tp) received pilots      Xp : (Nt, Tp) transmitted pilots
-        (1-D inputs are treated as one antenna.) Needs Tp >= Nt and Xp of full
-        row rank. Xp is the pilot matrix as actually transmitted, i.e. including
-        any 1/sqrt(n_tx) power split; the returned H_hat is therefore the channel
-        H itself, so pass it to the detectors with the same power_split as before.
-
-        N0=None  -> least squares:  H_hat = Yp Xp^H (Xp Xp^H)^-1
-        N0 given -> LMMSE for i.i.d. CN(0, prior_var) entries (Rayleigh):
-                    H_hat = Yp Xp^H (Xp Xp^H + (N0/prior_var) I)^-1
-        Returns H_hat of shape (Nr, Nt).
         """
         Yp = np.atleast_2d(np.asarray(Yp, dtype=complex))
         Xp = np.atleast_2d(np.asarray(Xp, dtype=complex))
@@ -317,11 +376,11 @@ class Receiver:
                 raise ValueError("N0 must be >= 0 and prior_var > 0.")
             A = A + (N0 / prior_var) * np.eye(Nt)
         B = Yp @ Xp.conj().T
-        return np.linalg.solve(A.T, B.T).T               # B A^-1
+        return np.linalg.solve(A.T, B.T).T
 
-    # ---------- non-coherent detection (no channel knowledge, no pilots) ----------
+    # ---------- non-coherent detection ----------
     def _require_psk(self):
-        """Differential schemes carry the data in the phase, so the constellation must be constant-modulus."""
+        """Differential schemes require a constant-modulus constellation."""
         mags = np.abs(self.table)
         if not np.allclose(mags, mags[0]):
             raise ValueError(
@@ -330,27 +389,13 @@ class Receiver:
             )
 
     def _slice_phase(self, z):
-        """Closest constellation point by phase: argmax Re(conj(table) * z). Safe when z = 0."""
+        """Closest constellation point by phase."""
         z = np.asarray(z, dtype=complex)
         return np.argmax(np.real(np.conj(self.table) * z[..., None]), axis=-1)
 
     def differential_detect(self, y):
         """
-        Differential (DPSK) detection for a transmitter that used differential_encode().
-
-        y : (T+1,) received samples, or (Nr, T+1) for Nr receive antennas. The
-            first sample is the reference. The detector never sees h or N0: with a
-            channel that is constant over two consecutive samples,
-
-                y_t * conj(y_{t-1}) = |h|^2 * sqrt(A) * s_t + noise,
-
-        so the phase of the product gives the symbol. With several receive
-        antennas the products are summed over the antennas (receive diversity)
-        before slicing. Returns T symbol indices (not bits).
-
-        The fading must stay (almost) constant between neighbouring samples,
-        e.g. MIMOLTapChannel with L = 1. It does not work with Rayleigh_Channel,
-        which draws a new gain for every sample.
+        Differential (DPSK) detection.
         """
         self._require_psk()
         y = np.atleast_2d(np.asarray(y, dtype=complex))
@@ -361,24 +406,12 @@ class Receiver:
         return self._slice_phase(z)
 
     def decode_differential(self, y):
-        """Differential detection followed by the bit lookup. Returns a 1-D bit array."""
+        """Differential detection followed by the bit lookup."""
         return self.bit_table[self.differential_detect(y)].ravel()
 
     def differential_alamouti_detect(self, Y):
         """
-        Non-coherent detection for 2 transmit antennas, for a transmitter that used
-        differential_alamouti_encode() (Tarokh-Jafarkhani differential STBC).
-
-        Y : (Nr, 2*(P+1)) received matrix, first block = reference. Block t obeys
-        Y_t = Y_{t-1} B(s1, s2) + noise, where B = [[s1, -s2*], [s2, s1*]], so the
-        pair (s1, s2) is found from two consecutive blocks without knowing H:
-
-            s1_hat = sum_r [conj(p1) q1 + p2 conj(q2)] / E
-            s2_hat = sum_r [conj(p2) q1 - p1 conj(q2)] / E
-
-        with p1, p2 the two columns of the previous block, q1, q2 the current ones
-        and E = sum_r (|p1|^2 + |p2|^2). This is Alamouti combining where the
-        previous block plays the role of the channel. Returns 2P symbol indices.
+        Non-coherent differential Alamouti detection.
         """
         self._require_psk()
         Y = np.atleast_2d(np.asarray(Y, dtype=complex))
@@ -386,13 +419,12 @@ class Receiver:
         if Y.shape[1] % 2 != 0 or Y.shape[1] < 4:
             raise ValueError("Y needs an even number of columns: reference block plus at least one data block.")
 
-        c1, c2 = Y[:, 0::2], Y[:, 1::2]                 # first / second column of every block
+        c1, c2 = Y[:, 0::2], Y[:, 1::2]
         p1, p2, q1, q2 = c1[:, :-1], c2[:, :-1], c1[:, 1:], c2[:, 1:]
         E = np.maximum(np.sum(np.abs(p1) ** 2 + np.abs(p2) ** 2, axis=0), 1e-300)
         s1 = np.sum(np.conj(p1) * q1 + p2 * np.conj(q2), axis=0) / E
         s2 = np.sum(np.conj(p2) * q1 - p1 * np.conj(q2), axis=0) / E
 
-        # s_i = a_i / sqrt(2) with a_i a unit-modulus PSK point; bring back to the constellation scale
         scale = np.sqrt(2 * self.constellation.A)
         idx = np.empty(2 * s1.size, dtype=int)
         idx[0::2] = self._slice_phase(scale * s1)
@@ -400,33 +432,13 @@ class Receiver:
         return idx
 
     def decode_differential_alamouti(self, Y):
-        """Differential Alamouti detection followed by the bit lookup. Returns a 1-D bit array."""
+        """Differential Alamouti detection followed by bit lookup."""
         return self.bit_table[self.differential_alamouti_detect(Y)].ravel()
 
-    # ---------- non-coherent: energy detection (OOK / amplitude constellations) ----------
+    # ---------- non-coherent: energy detection ----------
     def energy_detect(self, y, N0=None, fading_var=1.0):
         """
-        Energy (envelope) detector for constellations whose points differ in
-        MAGNITUDE only, e.g. OOK = Constellation("OOK", mapping={"0": 0, "1": 1}) or
-        several amplitude levels. The phase is never used, so no channel phase,
-        no pilots and no h are needed, and it also works with the per-sample
-        gains of Rayleigh_Channel.
-
-        y : (T,) or (Nr, T) received samples. The energy is summed over the Nr antennas.
-
-        fading_var = E|h|^2 (default 1, Rayleigh like the project channels), N0 required:
-            the energy under symbol i is exponential (Gamma with Nr terms) with mean
-            m_i = N0 + fading_var*|s_i|^2, so the ML rule picks the i that maximises
-            -Nr*ln(m_i) - E/m_i  (for OOK this is a single threshold on E).
-        fading_var=None (plain AWGN, h = 1): pick the level whose energy |s_i|^2 + N0
-            is closest to the measured average energy; N0 is not needed.
-
-        Caveat: with fading the gain scales the energy, so a constellation with more than
-        two levels gets confused even without noise. Use OOK under fading; amplitude
-        levels (ASK) are only reliable on AWGN (fading_var=None).
-
-        Returns symbol indices (not bits). Raises ValueError if two constellation
-        points share the same magnitude (e.g. PAM/PSK/QAM symmetric points).
+        Energy (envelope) detector for OOK and amplitude constellations.
         """
         levels = np.abs(self.table) ** 2
         if len(np.unique(np.round(levels, 12))) != self.M:
@@ -437,7 +449,7 @@ class Receiver:
         y = np.atleast_2d(np.asarray(y, dtype=complex))
         y = np.vstack([self.waveform.demodulate(row) for row in y])
         Nr = y.shape[0]
-        E = np.sum(np.abs(y) ** 2, axis=0)                       # (T,)
+        E = np.sum(np.abs(y) ** 2, axis=0)
 
         if fading_var is None:
             n0 = 0.0 if N0 is None else N0
@@ -447,25 +459,17 @@ class Receiver:
             raise ValueError("Fading ML energy detection needs N0 > 0.")
         if fading_var <= 0:
             raise ValueError("fading_var must be positive (or None for plain AWGN).")
-        m = N0 + fading_var * levels                              # (M,)
+        m = N0 + fading_var * levels
         return np.argmax(-Nr * np.log(m)[None, :] - E[:, None] / m[None, :], axis=1)
 
     def decode_energy(self, y, N0=None, fading_var=1.0):
-        """Energy detection followed by the bit lookup. Returns a 1-D bit array."""
+        """Energy detection followed by bit lookup."""
         return self.bit_table[self.energy_detect(y, N0, fading_var)].ravel()
 
     # ---------- non-coherent: orthogonal M-FSK ----------
     def fsk_detect(self, Y):
         """
-        Non-coherent detection of orthogonal M-FSK (M = constellation.M tones; the
-        symbol index is the tone index, the constellation points themselves are not used).
-
-        Y : (M, T) correlator outputs, row m = tone m, or (Nr, M, T) for Nr receive
-        antennas. In every branch y_m = h*x_m + n_m with x_m = sqrt(A) for the sent
-        tone and 0 otherwise, so the phase of h is irrelevant: pick the tone with the
-        largest energy |y_m|^2 (summed over antennas). This is the ML rule for
-        Rayleigh fading and for AWGN with unknown phase, and needs neither h nor N0.
-        Returns T symbol indices.
+        Non-coherent detection of orthogonal M-FSK.
         """
         Y = np.asarray(Y, dtype=complex)
         if Y.ndim == 2:
@@ -475,16 +479,16 @@ class Receiver:
         return np.argmax(np.sum(np.abs(Y) ** 2, axis=0), axis=0)
 
     def decode_fsk(self, Y):
-        """Non-coherent FSK detection followed by the bit lookup. Returns a 1-D bit array."""
+        """Non-coherent FSK detection followed by bit lookup."""
         return self.bit_table[self.fsk_detect(Y)].ravel()
 
     # ---------- helpers ----------
     def bits_to_indices(self, bits):
-        """Group bits into chunks of k and turn each chunk into an integer (the symbol index)."""
+        """Group bits into chunks of k and turn each chunk into an integer."""
         bits = np.asarray(bits, dtype=int).ravel()
         if len(bits) % self.k != 0:
             raise ValueError("Number of bits must be a multiple of log2(M).")
-        w = 1 << np.arange(self.k - 1, -1, -1)   # binary weights, e.g. [4,2,1] for k=3
+        w = 1 << np.arange(self.k - 1, -1, -1)
         return bits.reshape(-1, self.k) @ w
 
     def ber(self, tx_bits, rx_bits):
@@ -495,21 +499,13 @@ class Receiver:
         return np.mean(tx_bits != rx_bits)
 
     def ser(self, tx_bits, rx_bits):
-        """Fraction of symbols that came out wrong (one wrong bit = whole symbol wrong)."""
+        """Fraction of symbols that came out wrong."""
         return np.mean(self.bits_to_indices(tx_bits) != self.bits_to_indices(rx_bits))
 
 
 def pilot_matrix(n_tx, n_pilots=None, Es=1.0, power_split=True):
     """
-    Orthogonal pilot matrix Xp of shape (n_tx, n_pilots), n_pilots >= n_tx
-    (default n_pilots = n_tx). Rows are DFT sequences, so every pilot has
-    constant modulus and Xp Xp^H is a multiple of the identity, which makes the
-    least-squares estimate as clean as it can be.
-
-    Energy follows CodingScheme: total energy per channel use is Es (each
-    antenna gets Es/n_tx) when power_split=True, otherwise Es per antenna.
-    The transmitter and receiver must build the same matrix, so both can call
-    this function (it is deterministic).
+    Orthogonal pilot matrix Xp of shape (n_tx, n_pilots).
     """
     if not isinstance(n_tx, (int, np.integer)) or n_tx <= 0:
         raise ValueError("n_tx must be a positive integer.")
@@ -525,13 +521,7 @@ def pilot_matrix(n_tx, n_pilots=None, Es=1.0, power_split=True):
 
 def differential_encode(symbols, A=1.0):
     """
-    Differential PSK encoder (transmit side of Receiver.differential_detect).
-
-    symbols : constant-modulus constellation symbols (|s|^2 = A, e.g. PSK from
-              Transmitter.run with the SC waveform and no cyclic prefix).
-    Returns T+1 symbols: a reference sqrt(A) followed by d_t = d_{t-1} * s_t / sqrt(A),
-    i.e. the information is in the phase change between neighbouring samples.
-    Feed the result to the channel like ordinary symbols.
+    Differential PSK encoder.
     """
     s = np.asarray(symbols, dtype=complex).ravel()
     if A <= 0:
@@ -546,15 +536,7 @@ def differential_encode(symbols, A=1.0):
 
 def differential_alamouti_encode(symbols, Es=1.0, power_split=True):
     """
-    Differential Alamouti encoder (transmit side of
-    Receiver.differential_alamouti_detect). Two antennas, shape (2, 2*(P+1)).
-
-    symbols : 2P constant-modulus PSK symbols with |s|^2 = Es, taken in pairs (u1, u2).
-    Each pair becomes s = (u1, u2) / sqrt(2*Es), and the transmitted blocks are
-    X_t = scale * U_t with U_t = U_{t-1} * [[s1, -s2*], [s2, s1*]]. The first block
-    is a fixed unitary reference. U_t stays unitary, so every channel use carries
-    energy Es in total (power_split=True, like CodingScheme) or Es per antenna
-    (power_split=False).
+    Differential Alamouti encoder.
     """
     u = np.asarray(symbols, dtype=complex).ravel()
     if Es <= 0:
@@ -562,12 +544,12 @@ def differential_alamouti_encode(symbols, Es=1.0, power_split=True):
     if u.size == 0 or u.size % 2 != 0:
         raise ValueError("Need a non-empty even number of symbols.")
     if not np.allclose(np.abs(u) ** 2, Es):
-        raise ValueError("Differential Alamouti needs constant-modulus symbols with |s|^2 = Es (PSK).")
+        raise ValueError("Differential Alamouti needs constant-modulus PSK symbols.")
 
-    a = u / np.sqrt(Es) / np.sqrt(2)                      # |a1|^2 + |a2|^2 = 1
+    a = u / np.sqrt(Es) / np.sqrt(2)
     P = a.size // 2
     r = 1 / np.sqrt(2)
-    U = np.array([[r, -r], [r, r]], dtype=complex)        # reference block (Alamouti form, unitary)
+    U = np.array([[r, -r], [r, r]], dtype=complex)
     scale = np.sqrt(Es) if power_split else np.sqrt(2 * Es)
     X = np.empty((2, 2 * (P + 1)), dtype=complex)
     X[:, 0:2] = scale * U
@@ -580,13 +562,7 @@ def differential_alamouti_encode(symbols, Es=1.0, power_split=True):
 
 def fsk_encode(indices, M, Es=1.0):
     """
-    Orthogonal M-FSK in the correlator domain (transmit side of Receiver.fsk_detect).
-
-    indices : symbol indices 0..M-1, e.g. Receiver.bits_to_indices(bits).
-    Returns an (M, T) matrix with sqrt(Es) in row indices[t] of column t and 0
-    elsewhere: one tone per channel use, Es energy per symbol. Pass every row
-    through the SAME channel gain (h*X + noise), since all tones share one fading
-    coefficient; use Nr of them for receive diversity.
+    Orthogonal M-FSK encoder in the correlator domain.
     """
     idx = np.asarray(indices, dtype=int).ravel()
     if M < 2 or (M & (M - 1)) != 0:
@@ -607,8 +583,7 @@ def qfunc(x):
 
 def theory_ser_qam(M, EsN0):
     """
-    Exact SER for square M-QAM (Gray mapping) over AWGN. EsN0 is linear, not dB.
-    Use it to sanity-check the simulation.
+    Exact SER for square M-QAM over AWGN.
     """
     p = 2 * (1 - 1 / math.sqrt(M)) * qfunc(math.sqrt(3 * EsN0 / (M - 1)))
     return 1 - (1 - p) ** 2
@@ -617,24 +592,16 @@ def theory_ser_qam(M, EsN0):
 def monte_carlo(constellation, channel, EbN0_dB, n_bits=100_000, n_trials=20, seed=None):
     """
     Monte Carlo BER/SER sweep.
-
-    channel  : function(Data, Nzero) -> noisy data (e.g. your AWGN_Channel)
-    EbN0_dB  : list of Eb/N0 points in dB
-    n_bits   : bits per trial
-    n_trials : how many times we repeat each point (needed for the variance)
-
-    Returns a dict with mean + variance (across trials) of BER and SER at each point.
     """
     rng = np.random.default_rng(seed)
     rx = Receiver(constellation)
     k, Es = constellation.bits_per_symbol, constellation.A
 
-    n_bits -= n_bits % k   # need whole symbols, so drop any leftover bits
+    n_bits -= n_bits % k
 
     out = {"EbN0_dB": [], "ber_mean": [], "ber_var": [], "ser_mean": [], "ser_var": []}
 
     for ebn0_db in EbN0_dB:
-        # dB -> linear, then get the noise level: Eb = Es/k, N0 = Eb / (Eb/N0)
         N0 = (Es / k) / (10 ** (ebn0_db / 10))
 
         bers, sers = [], []
@@ -642,7 +609,6 @@ def monte_carlo(constellation, channel, EbN0_dB, n_bits=100_000, n_trials=20, se
             bits = rng.integers(0, 2, n_bits)
             idx = rx.bits_to_indices(bits)
 
-            # same symbols the Transmitter would make, just done in one vectorized step
             y = channel(constellation.table[idx], N0)
 
             rbits = rx.decode(y)
@@ -656,3 +622,4 @@ def monte_carlo(constellation, channel, EbN0_dB, n_bits=100_000, n_trials=20, se
         out["ser_var"].append(np.var(sers, ddof=1))
 
     return {key: np.array(v) for key, v in out.items()}
+
