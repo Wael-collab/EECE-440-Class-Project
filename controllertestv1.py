@@ -1,3 +1,4 @@
+
 import time
 
 import numpy as np
@@ -58,16 +59,6 @@ def check_mimo_mode(channel):
         and numrx < numtx
     ):
         st.error("Zero-forcing detection requires Nr >= Nt.")
-        return False
-
-    if (
-        channel in ("Rician", "Rayleigh")
-        and not st.session_state.get(f"{channel.lower()}_coherent", True)
-    ):
-        st.warning(
-            "Noncoherent detection is not implemented. "
-            "Enable Coherent Detection (Perfect Channel Knowledge)."
-        )
         return False
 
     return True
@@ -153,11 +144,11 @@ def clear_simulation_results():
         "rician_transmitters", "rician_receivers", "rician_c",
         "rician_constellation_type", "rician_M_value", "rician_A_value",
         "rician_N_value", "rician_N0_value", "rician_K_value",
-        "rician_K_input", "rician_coherent", "rician_repetitions",
+        "rician_K_input", "rician_repetitions",
         "rician_repetitions_value",
         "rayleigh_transmitters", "rayleigh_receivers", "rayleigh_c",
-        "rayleigh_constellation_type", "rayleigh_M_value", "rayleigh_A_value",
-        "rayleigh_N_value", "rayleigh_N0_value", "rayleigh_coherent",
+        "rayleigh_constellation_type", "rayleigh_M_value",
+        "rayleigh_A_value", "rayleigh_N_value", "rayleigh_N0_value",
         "rayleigh_repetitions", "rayleigh_repetitions_value",
     ])
 
@@ -208,7 +199,7 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
         Each receiving antenna is assigned its own information stream,
         delivered sequentially as in the original Rx-diversity design.
         All Nt physical Tx antennas transmit that receiver's symbols in
-        Nt *orthogonal time slots* (one active per slot). That receiving
+        Nt orthogonal time slots (one active per slot). That receiving
         antenna then combines its Nt observations with MRC. All Nr
         destination streams occupy separate frames, and one channel H
         is held constant throughout a realization. The 1/sqrt(Nt)
@@ -260,7 +251,6 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
         # ----------------------------------------------------
         start = time.perf_counter()
         if is_tx_diversity:
-            # One different sequentially delivered stream per receiver.
             bits = np.random.randint(0, 2, size=(numrx, N))
         else:
             bits = np.random.randint(0, 2, size=(numtx, N))
@@ -292,9 +282,6 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
         # 4. Channel + diversity/MIMO detection
         # ----------------------------------------------------
         if mode == "Receive Diversity":
-            # For each independently sent Tx stream, all Nr receivers
-            # observe the same symbols, with independent receive noise.
-            # A fading channel supplies a separate H column for that Tx.
             received_per_transmitter = []
             channel_per_transmitter = []
             decoded = []
@@ -330,19 +317,14 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
                 received_per_transmitter.append(Y)
                 channel_per_transmitter.append(h)
 
-            received = np.asarray(received_per_transmitter)  # (Nt,Nr,Nsym)
-            H = np.asarray(channel_per_transmitter)            # (Nt,Nr)
+            received = np.asarray(received_per_transmitter)
+            H = np.asarray(channel_per_transmitter)
 
         elif mode == "Transmit Diversity":
-            # Exactly symmetric to Rx diversity in the traffic model:
-            # Rx r is the intended destination in frame r. All Nt Tx
-            # antennas transmit Rx r's own information stream in Nt
-            # orthogonal slots, one physical Tx active per slot.
-            # Every receiver sees all frames, but each receiver decodes
-            # only its own frame using Nt-branch MRC (no joint Rx MRC).
             start = time.perf_counter()
             frame_symbols = numtx * num_symbols
             X = np.zeros((numtx, numrx * frame_symbols), dtype=complex)
+
             for r in range(numrx):
                 for t in range(numtx):
                     begin = r * frame_symbols + t * num_symbols
@@ -364,18 +346,19 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
                 )
 
             if Y.shape != (numrx, numrx * frame_symbols):
-                raise ValueError(f"Transmit-diversity channel returned {Y.shape}.")
+                raise ValueError(
+                    f"Transmit-diversity channel returned {Y.shape}."
+                )
             timings["Channel transmission"] += time.perf_counter() - start
 
             start = time.perf_counter()
-            # Shape (Nr, Nt, Nsym): only the intended frame for each Rx.
-            # Each receiver r has its own message and Nt MRC branches.
             received = np.asarray([
                 Y[r, r * frame_symbols:(r + 1) * frame_symbols].reshape(
                     numtx, num_symbols
                 )
                 for r in range(numrx)
             ])
+
             decoded = [
                 decoded_vector(
                     receivers[r].decode_mrc(
@@ -393,7 +376,6 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
         else:  # Spatial Multiplexing (ZF)
             start = time.perf_counter()
             if channel == "AWGN":
-                # Preserve the original AWGN spatial-multiplexing model.
                 H = H_los / np.sqrt(numrx)
                 received = np.asarray(AWGN_Channel(H @ samples, N0))
             else:
@@ -415,7 +397,6 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
                     for i in range(numtx)
                 ]
             else:
-                # This exactly follows the existing fading ZF decoder.
                 decoded_interleaved = receivers[0].decode_mimo(
                     Y=received,
                     H=H,
@@ -425,6 +406,7 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
                 decoded = np.asarray(decoded_interleaved).reshape(
                     num_symbols, numtx, k
                 ).transpose(1, 0, 2).reshape(numtx, N)
+
             timings["Coherent detection and decoding"] += (
                 time.perf_counter() - start
             )
@@ -432,7 +414,8 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
         decoded = np.asarray(decoded, dtype=int)
         if decoded.shape != (num_results, N):
             raise ValueError(
-                f"Decoded bit shape {decoded.shape}; expected ({num_results}, {N})."
+                f"Decoded bit shape {decoded.shape}; "
+                f"expected ({num_results}, {N})."
             )
 
         # ----------------------------------------------------
@@ -443,7 +426,6 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
         total_bits += N
         timings["BER calculation"] += time.perf_counter() - start
 
-        # Keep only the last realization for the bit-comparison table.
         last_bits = bits
         last_samples = samples
         last_received = received
@@ -471,6 +453,7 @@ def store_results(prefix, results):
         "H", "error_counts", "total_bits",
     ):
         st.session_state[f"{prefix}{name}"] = results[name]
+
     timing_key = "simulation_timings" if not prefix else f"{prefix}timings"
     st.session_state[timing_key] = results["timings"]
 
@@ -479,6 +462,7 @@ def initialize_modems(channel):
     prefix = "" if channel == "AWGN" else f"{channel.lower()}_"
     tx_key = f"{prefix}transmitters"
     rx_key = f"{prefix}receivers"
+
     if tx_key in st.session_state:
         return
 
@@ -493,6 +477,7 @@ def initialize_modems(channel):
 
     c = Constellation(constellation_type, M=M, A=A)
     mode = st.session_state.mimo_mode
+
     logical_tx_count = (
         st.session_state.numrx
         if mode == "Transmit Diversity" else st.session_state.numtx
@@ -501,8 +486,13 @@ def initialize_modems(channel):
         st.session_state.numrx
         if mode == "Transmit Diversity" else st.session_state.numtx
     )
-    st.session_state[tx_key] = [Transmitter(c) for _ in range(logical_tx_count)]
-    st.session_state[rx_key] = [Receiver(c) for _ in range(decoder_count)]
+
+    st.session_state[tx_key] = [
+        Transmitter(c) for _ in range(logical_tx_count)
+    ]
+    st.session_state[rx_key] = [
+        Receiver(c) for _ in range(decoder_count)
+    ]
     st.session_state[f"{prefix}c"] = c
 
     if mode == "Transmit Diversity":
@@ -521,6 +511,7 @@ def initialize_modems(channel):
 def display_simulation_results(channel):
     prefix = "" if channel == "AWGN" else f"{channel.lower()}_"
     state = st.session_state
+
     if f"{prefix}received" not in state:
         return
 
@@ -528,10 +519,12 @@ def display_simulation_results(channel):
     numtx = state.numtx
     numrx = state.numrx
     N = state.N if channel == "AWGN" else state[f"{prefix}N_value"]
+
     labels = "Receiver" if mode == "Transmit Diversity" else "Transmitter"
     num_results = numrx if mode == "Transmit Diversity" else numtx
 
     st.subheader(f"{channel} Simulation Results")
+
     if channel == "Rician":
         st.write(f"Rician K-factor (linear): {state.rician_K_value}")
     elif channel == "Rayleigh":
@@ -539,8 +532,14 @@ def display_simulation_results(channel):
 
     if channel != "AWGN":
         st.write("Detection mode: Coherent (Perfect CSI)")
-        st.write(f"Noise power spectral density (N0): {state[f'{prefix}N0_value']:.6f}")
-        st.write(f"Average symbol energy (A): {state[f'{prefix}A_value']:.6f}")
+        st.write(
+            f"Noise power spectral density (N0): "
+            f"{state[f'{prefix}N0_value']:.6f}"
+        )
+        st.write(
+            f"Average symbol energy (A): "
+            f"{state[f'{prefix}A_value']:.6f}"
+        )
         st.write(
             f"Modulation: {state[f'{prefix}constellation_type']}, "
             f"M = {state[f'{prefix}M_value']}"
@@ -559,6 +558,7 @@ def display_simulation_results(channel):
             "Receive Diversity: one transmitter sends its own stream at a "
             "time; all Nr receive branches are combined using MRC."
         )
+
     elif mode == "Transmit Diversity":
         st.info(
             "Transmit Diversity: each receiver has its own sequential "
@@ -570,6 +570,7 @@ def display_simulation_results(channel):
             "Nr streams are also time-multiplexed. "
             "The BER rows are per receiver, not per transmitter."
         )
+
     elif channel == "AWGN" and numrx < numtx:
         st.warning(
             "Nr < Nt: spatial multiplexing with pseudo-inverse ZF is "
@@ -577,6 +578,7 @@ def display_simulation_results(channel):
         )
 
     timing_key = "simulation_timings" if not prefix else f"{prefix}timings"
+
     display_timing_breakdown(
         state[timing_key],
         "Computational time only; browser rendering is excluded. "
@@ -591,6 +593,7 @@ def display_simulation_results(channel):
             "The bit comparison below is from the last channel "
             "realization; the BER values use all channel realizations."
         )
+
     display_bit_comparison(
         state[f"{prefix}bits"],
         state[f"{prefix}decoded_bits"],
@@ -603,9 +606,14 @@ def display_simulation_results(channel):
         "Monte Carlo BER (Averaged over channel realizations)"
         if channel != "AWGN" else "Bit Error Rates"
     )
+
     for i, value in enumerate(state[f"{prefix}ber"]):
         st.metric(f"BER - {labels} {i+1}", f"{value:.6f}")
-    st.metric("Overall Average BER", f"{np.mean(state[f'{prefix}ber']):.6f}")
+
+    st.metric(
+        "Overall Average BER",
+        f"{np.mean(state[f'{prefix}ber']):.6f}"
+    )
 
     if channel != "AWGN":
         st.subheader("Error Statistics")
@@ -623,66 +631,103 @@ def display_simulation_results(channel):
 
 @st.dialog("Simulation Parameters")
 def simulation_popup():
-    st.write("Let's get you started! What channel do you wish to test today?")
+    st.write(
+        "Let's get you started! What channel do you wish to test today?"
+    )
 
     channel = st.selectbox(
-        "Channel Model", ["AWGN", "Rayleigh", "Rician", "OFDM", "Multi-Tap Channel"]
-    )
-    mimo_mode = st.selectbox(
-        "MIMO Transmission Mode", MODES, index=2, key="initial_mimo_mode"
+        "Channel Model",
+        ["AWGN", "Rayleigh", "Rician", "OFDM", "Multi-Tap Channel"]
     )
 
-    # The min limits are enforced at the widget level as well as at launch.
+    mimo_mode = st.selectbox(
+        "MIMO Transmission Mode",
+        MODES,
+        index=2,
+        key="initial_mimo_mode"
+    )
+
     if mimo_mode == "Transmit Diversity":
         numtx = st.number_input(
-            "Number of Transmitting Antennas", min_value=2, value=2,
-            step=1, key="initial_numtx_diversity",
+            "Number of Transmitting Antennas",
+            min_value=2,
+            value=2,
+            step=1,
+            key="initial_numtx_diversity",
         )
     else:
         numtx = st.number_input(
-            "Number of Transmitting Antennas", min_value=1, value=1,
-            step=1, key="initial_numtx_other",
+            "Number of Transmitting Antennas",
+            min_value=1,
+            value=1,
+            step=1,
+            key="initial_numtx_other",
         )
 
     if mimo_mode == "Receive Diversity":
         numrx = st.number_input(
-            "Number of Receiving Antennas", min_value=2, value=2,
-            step=1, key="initial_numrx_diversity",
+            "Number of Receiving Antennas",
+            min_value=2,
+            value=2,
+            step=1,
+            key="initial_numrx_diversity",
         )
     else:
         numrx = st.number_input(
-            "Number of Receiving Antennas", min_value=1, value=1,
-            step=1, key="initial_numrx_other",
+            "Number of Receiving Antennas",
+            min_value=1,
+            value=1,
+            step=1,
+            key="initial_numrx_other",
         )
 
     if st.button("Confirm Parameters"):
         if mimo_mode == "Receive Diversity" and numrx < 2:
             st.error("Receive Diversity requires Nr >= 2.")
             return
+
         if mimo_mode == "Transmit Diversity" and numtx < 2:
             st.error("Transmit Diversity requires Nt >= 2.")
             return
 
         clear_simulation_results()
+
         clear_session_keys([
             "channel", "numtx", "numrx", "mimo_mode",
             "awgn_configured", "rician_configured", "rayleigh_configured",
         ])
+
         st.session_state.channel = channel
         st.session_state.numtx = int(numtx)
         st.session_state.numrx = int(numrx)
         st.session_state.mimo_mode = mimo_mode
+
+        # Close the new-simulation dialog before opening
+        # the selected channel's parameter dialog.
+        st.session_state.open_new_simulation = False
+
         st.rerun()
 
+
+# ============================================================
+# MAIN SIMULATION BUTTONS AND CONFIGURATION DISPLAY
+# ============================================================
 
 if "initialized" not in st.session_state:
     st.session_state.initialized = True
 
+if "open_new_simulation" not in st.session_state:
+    st.session_state.open_new_simulation = False
+
+
 if st.button("New BER Simulation"):
-    simulation_popup()
+    st.session_state.open_new_simulation = True
+    st.rerun()
+
 
 if "channel" in st.session_state:
     st.subheader("Current Simulation Configuration")
+
     st.write(f"Channel: {st.session_state.channel}")
     st.write(f"Transmitting Antennas: {st.session_state.numtx}")
     st.write(f"Receiving Antennas: {st.session_state.numrx}")
@@ -690,10 +735,14 @@ if "channel" in st.session_state:
 
     if st.button("Close Simulation"):
         clear_simulation_results()
+
         clear_session_keys([
             "channel", "numtx", "numrx", "mimo_mode",
             "awgn_configured", "rician_configured", "rayleigh_configured",
         ])
+
+        st.session_state.open_new_simulation = False
+
         st.rerun()
 
 
@@ -704,88 +753,152 @@ if "channel" in st.session_state:
 @st.dialog("AWGN Simulation Parameters")
 def awgn_popup():
     st.write("Please select AWGN Channel parameters")
-    constellation = st.selectbox("Constellation Type", ["PAM", "QAM", "PSK"])
-    M = st.selectbox("Modulation Order (M)", modulation_orders(constellation))
-    A = st.number_input(
-        "Average Symbol Energy (A)", min_value=0.000001,
-        value=1.0, step=0.5,
+
+    constellation = st.selectbox(
+        "Constellation Type",
+        ["PAM", "QAM", "PSK"]
     )
+
+    M = st.selectbox(
+        "Modulation Order (M)",
+        modulation_orders(constellation)
+    )
+
+    A = st.number_input(
+        "Average Symbol Energy (A)",
+        min_value=0.000001,
+        value=1.0,
+        step=0.5,
+    )
+
     st.divider()
+
     N = st.number_input(
         "Message Length (number of bits per information stream)",
-        min_value=1, value=64, step=1,
+        min_value=1,
+        value=64,
+        step=1,
     )
+
     N0 = st.number_input(
-        "Noise Power Spectral Density (N0)", min_value=0.0,
-        value=0.1, step=0.01, format="%.6f",
+        "Noise Power Spectral Density (N0)",
+        min_value=0.0,
+        value=0.1,
+        step=0.01,
+        format="%.6f",
     )
 
     if st.button("Start AWGN Simulation"):
         k = int(np.log2(M))
+
         if N % k:
-            st.error(f"Message length must be divisible by {k} for M={M}.")
+            st.error(
+                f"Message length must be divisible by {k} for M={M}."
+            )
             return
+
         st.session_state.constellation = constellation
         st.session_state.M = M
         st.session_state.A = A
         st.session_state.N = int(N)
         st.session_state.N0 = float(N0)
+
         st.session_state.awgn_configured = True
+
         clear_session_keys(result_keys(""))
         clear_session_keys(["transmitters", "receivers", "c"])
+
         st.rerun()
 
 
 def fading_popup(channel):
-    """Shared parameter form; retains all original Rician/Rayleigh state keys."""
+    """Shared parameter form for Rician and Rayleigh channels."""
+
     prefix = f"{channel.lower()}_"
+
     st.write(f"Please select {channel} Channel parameters")
+
     constellation = st.selectbox(
-        "Constellation Type", ["PAM", "QAM", "PSK"], key=f"{prefix}constellation"
+        "Constellation Type",
+        ["PAM", "QAM", "PSK"],
+        key=f"{prefix}constellation"
     )
+
     M = st.selectbox(
-        "Modulation Order (M)", modulation_orders(constellation), key=f"{prefix}M"
+        "Modulation Order (M)",
+        modulation_orders(constellation),
+        key=f"{prefix}M"
     )
+
     A = st.number_input(
-        "Average Symbol Energy (A)", min_value=0.000001,
-        value=1.0, step=0.5, key=f"{prefix}A",
+        "Average Symbol Energy (A)",
+        min_value=0.000001,
+        value=1.0,
+        step=0.5,
+        key=f"{prefix}A",
     )
+
     st.divider()
+
     N = st.number_input(
         "Message Length (number of bits per information stream)",
-        min_value=1, value=64, step=1, key=f"{prefix}N",
+        min_value=1,
+        value=64,
+        step=1,
+        key=f"{prefix}N",
     )
+
     N0 = st.number_input(
         "Noise Power Spectral Density (N0)",
-        min_value=0.0, value=0.1, step=0.01, format="%.6f",
+        min_value=0.0,
+        value=0.1,
+        step=0.01,
+        format="%.6f",
         key=f"{prefix}N0",
     )
+
     K = 0.0
+
     if channel == "Rician":
         K = st.number_input(
-            "Rician K-factor (linear scale)", min_value=0.0,
-            value=1.0, step=0.5, key="rician_K_input",
+            "Rician K-factor (linear scale)",
+            min_value=0.0,
+            value=1.0,
+            step=0.5,
+            key="rician_K_input",
         )
+
         st.caption(
             "K = 0 is Rayleigh; larger K means a stronger LoS component."
         )
 
     num_repetitions = st.number_input(
         "Number of Channel Realizations to Average Over",
-        min_value=1, value=100, step=10, key=f"{prefix}repetitions",
+        min_value=1,
+        value=100,
+        step=10,
+        key=f"{prefix}repetitions",
     )
+
     st.caption(
         "Each repetition draws a new independent fading channel. "
         "With receive diversity, each sequential transmitter has its "
         "own SIMO channel realization. The final BER is total bit "
         "errors divided by total transmitted/tested bits."
     )
-    st.info("Detection mode: Coherent Detection (Perfect Channel Knowledge).")
+
+    # Coherent detection is always enabled.
+    st.info(
+        "Detection mode: Coherent Detection (Perfect Channel Knowledge)."
+    )
 
     if st.button(f"Start {channel} Simulation"):
         k = int(np.log2(M))
+
         if N % k:
-            st.error(f"Message length must be divisible by {k} for M={M}.")
+            st.error(
+                f"Message length must be divisible by {k} for M={M}."
+            )
             return
 
         st.session_state[f"{prefix}constellation_type"] = constellation
@@ -793,14 +906,24 @@ def fading_popup(channel):
         st.session_state[f"{prefix}A_value"] = A
         st.session_state[f"{prefix}N_value"] = int(N)
         st.session_state[f"{prefix}N0_value"] = float(N0)
+
         if channel == "Rician":
             st.session_state.rician_K_value = float(K)
-        st.session_state[f"{prefix}repetitions_value"] = int(num_repetitions)
+
+        st.session_state[f"{prefix}repetitions_value"] = int(
+            num_repetitions
+        )
+
         st.session_state[f"{prefix}configured"] = True
+
         clear_session_keys(result_keys(prefix))
+
         clear_session_keys([
-            f"{prefix}transmitters", f"{prefix}receivers", f"{prefix}c",
+            f"{prefix}transmitters",
+            f"{prefix}receivers",
+            f"{prefix}c",
         ])
+
         st.rerun()
 
 
@@ -820,18 +943,28 @@ def rayleigh_popup():
 
 def render_configured_simulation(channel):
     prefix = "" if channel == "AWGN" else f"{channel.lower()}_"
+
     initialize_modems(channel)
 
     if st.button(f"Run {channel} Simulation"):
+
         if check_mimo_mode(channel):
+
             if channel == "AWGN":
-                N, N0 = st.session_state.N, st.session_state.N0
-                repetitions, K = 1, 0.0
+                N = st.session_state.N
+                N0 = st.session_state.N0
+                repetitions = 1
+                K = 0.0
+
             else:
                 N = st.session_state[f"{prefix}N_value"]
                 N0 = st.session_state[f"{prefix}N0_value"]
                 repetitions = st.session_state[f"{prefix}repetitions_value"]
-                K = st.session_state.rician_K_value if channel == "Rician" else 0.0
+
+                K = (
+                    st.session_state.rician_K_value
+                    if channel == "Rician" else 0.0
+                )
 
             try:
                 result = run_simulation(
@@ -843,12 +976,21 @@ def render_configured_simulation(channel):
                     repetitions=repetitions,
                     K=K,
                 )
-            except (ValueError, IndexError, np.linalg.LinAlgError) as exc:
+
+            except (
+                ValueError,
+                IndexError,
+                np.linalg.LinAlgError
+            ) as exc:
                 st.error(f"Simulation failed: {exc}")
+
             else:
                 store_results(prefix, result)
+
                 if channel == "AWGN":
-                    st.success(f"AWGN {st.session_state.mimo_mode} completed!")
+                    st.success(
+                        f"AWGN {st.session_state.mimo_mode} completed!"
+                    )
                 else:
                     st.success(
                         f"{channel} {st.session_state.mimo_mode} completed "
@@ -858,23 +1000,44 @@ def render_configured_simulation(channel):
     display_simulation_results(channel)
 
 
-if st.session_state.get("channel") == "AWGN":
+# ============================================================
+# DIALOG SELECTION AND SIMULATION EXECUTION
+# ============================================================
+
+# IMPORTANT:
+# Only ONE dialog function is called per script run.
+#
+# The new simulation dialog has priority.
+# Once confirmed, the selected channel's parameter dialog
+# is opened on the next rerun.
+
+if st.session_state.get("open_new_simulation", False):
+
+    simulation_popup()
+
+elif st.session_state.get("channel") == "AWGN":
+
     if not st.session_state.get("awgn_configured", False):
         awgn_popup()
     else:
         render_configured_simulation("AWGN")
 
 elif st.session_state.get("channel") == "Rician":
+
     if not st.session_state.get("rician_configured", False):
         rician_popup()
     else:
         render_configured_simulation("Rician")
 
 elif st.session_state.get("channel") == "Rayleigh":
+
     if not st.session_state.get("rayleigh_configured", False):
         rayleigh_popup()
     else:
         render_configured_simulation("Rayleigh")
 
 elif st.session_state.get("channel") in ("OFDM", "Multi-Tap Channel"):
-    st.warning(f"{st.session_state.channel} has not been implemented yet.")
+
+    st.warning(
+        f"{st.session_state.channel} has not been implemented yet."
+    )
