@@ -12,7 +12,9 @@ class Receiver:
 
     Besides the SISO detector it has the MIMO receivers matching Coding_Schemes
     (Y = H X + N, X of shape (n_tx, T)): scalar/MIMO ZF and MMSE, ordered SIC
-    (V-BLAST), Alamouti combining and pilot-based channel estimation, plus
+    (V-BLAST), Alamouti combining and pilot-based channel estimation,
+    Viterbi MLSE for single-carrier ISI channels, SISO or MIMO (mlse_detect, mlse_detect_mimo) with
+    reduced-state variants (M-algorithm, K-best sphere candidates, channel-shortening prefilter), plus
     non-coherent detection that needs neither the channel nor pilots:
     differential (DPSK, differential Alamouti), energy detection (OOK /
     amplitude levels) and orthogonal M-FSK.
@@ -481,6 +483,418 @@ class Receiver:
     def decode_fsk(self, Y):
         """Non-coherent FSK detection followed by bit lookup."""
         return self.bit_table[self.fsk_detect(Y)].ravel()
+
+    # ---------- Viterbi / reduced-state MLSE for single-carrier ISI channels ----------
+    # Model: Y[:, n] = sum_j H[:, :, j] @ x[:, n-j] + noise, with one symbol per transmit antenna in
+    # x[:, n]. The Nt symbols sent in one step are treated as ONE joint symbol from an alphabet of
+    # size Mv = M^Nt (antenna i is digit i of the joint index, base M), so SISO is just Nt = 1.
+
+    def _joint_values(self, Nt):
+        """(Mv, Nt) symbol values of every joint symbol index."""
+        digits = (np.arange(self.M ** Nt)[:, None] // self.M ** np.arange(Nt)[None, :]) % self.M
+        return self.table[digits]
+
+    # ----- channel-shortening prefilter (MMSE-DFE style) -----
+    def design_prefilter(self, H, N0, n_taps, n_ff=None, delay=None, power_split=True):
+        """
+        Design a prefilter that shortens the channel to n_taps taps for the trellis.
+
+        H has shape (Nr, Nt, L) (as returned by MIMOLTapChannel; (Nr, Nt) or a 1-D h are also
+        accepted). The filter W (n_ff taps, Nt x Nr each, delayed by `delay` samples) and the
+        monic target B (n_taps matrices, Nt x Nt) minimise E|x[m] - W*y - feedback|^2, i.e. the
+        MMSE-DFE solution (Falconer-Magee prefilter): W*y = sum_j B_j x[m-j] + e[m]. The residual e
+        is then whitened across antennas, so the Viterbi metric is a plain Euclidean distance on a
+        channel with only n_taps taps (trellis size M^(Nt*(n_taps-1)) instead of M^(Nt*(L-1))).
+        Needs the noise variance N0 > 0. delay=None picks the delay with the smallest error.
+
+        Returns dict(W=(n_ff, Nt, Nr), B=(n_taps, Nt, Nt), delay=int, error_cov=(Nt, Nt)).
+        """
+        H = np.asarray(H, dtype=complex)
+        if H.ndim == 1:
+            H = H[None, None, :]
+        elif H.ndim == 2:
+            H = H[:, :, None]
+        if H.ndim != 3:
+            raise ValueError("H must have shape (Nr, Nt, L).")
+        Nr, Nt, L = H.shape
+        if not N0 > 0:
+            raise ValueError("The prefilter design needs N0 > 0.")
+        Lt = int(n_taps)
+        if Lt < 1:
+            raise ValueError("n_taps must be a positive integer.")
+        Nw = max(2 * L, 8) if n_ff is None else int(n_ff)
+        if Nw < 1 or Nw + L - 1 < Lt:
+            raise ValueError("n_ff is too small for this many target taps.")
+        if power_split:
+            H = H / np.sqrt(Nt)
+        A = self.constellation.A
+
+        nx = Nw + L - 1                               # symbols seen by the prefilter window
+        Hs = np.zeros((Nr * Nw, Nt * nx), dtype=complex)
+        for k in range(Nw):                            # y[m+d-k] = sum_l H_l x[m+d-k-l]
+            for l in range(L):
+                Hs[k * Nr:(k + 1) * Nr, (k + l) * Nt:(k + l + 1) * Nt] = H[:, :, l]
+        dim_y, dim_f = Nr * Nw, Nt * (Lt - 1)
+
+        best = None
+        for d in ([int(delay)] if delay is not None else range(nx - Lt + 1)):
+            if not 0 <= d <= nx - Lt:
+                raise ValueError("delay is out of range for n_ff and n_taps.")
+            S0 = np.zeros((Nt, Nt * nx), dtype=complex)
+            S0[:, d * Nt:(d + 1) * Nt] = np.eye(Nt)
+            Sf = np.zeros((dim_f, Nt * nx), dtype=complex)
+            for j in range(1, Lt):
+                Sf[(j - 1) * Nt:j * Nt, (d + j) * Nt:(d + j + 1) * Nt] = np.eye(Nt)
+            Om = np.vstack([Hs, Sf])                   # phi = [y window; fed-back symbols] = Om x + [v; 0]
+            Rpp = A * Om @ Om.conj().T
+            Rpp[:dim_y, :dim_y] += N0 * np.eye(dim_y)
+            Rxp = A * S0 @ Om.conj().T
+            theta = np.linalg.solve(Rpp, Rxp.conj().T).conj().T
+            Se = A * np.eye(Nt) - theta @ Rxp.conj().T
+            Se = (Se + Se.conj().T) / 2 + 1e-12 * A * np.eye(Nt)
+            score = np.linalg.slogdet(Se)[1]
+            if best is None or score < best[0]:
+                best = (score, d, theta, Se)
+        _, d, theta, Se = best
+
+        Cinv = np.linalg.inv(np.linalg.cholesky(Se))   # whitens the residual: Cinv Se Cinv^H = I
+        W = np.stack([Cinv @ theta[:, k * Nr:(k + 1) * Nr] for k in range(Nw)])
+        B = np.stack([Cinv] + [-Cinv @ theta[:, dim_y + (j - 1) * Nt:dim_y + j * Nt]
+                               for j in range(1, Lt)])
+        return {"W": W, "B": B, "delay": d, "error_cov": Se}
+
+    @staticmethod
+    def _apply_prefilter(Y, W, delay, T):
+        """z[m] = sum_k W_k y[m + delay - k] for m = 0..T-1 (zeros outside the received block)."""
+        Nw, Nt, Nr = W.shape
+        Yp = np.concatenate([np.zeros((Nr, Nw), dtype=complex), Y,
+                             np.zeros((Nr, delay), dtype=complex)], axis=1)
+        Z = np.zeros((Nt, T), dtype=complex)
+        for k in range(Nw):
+            s = delay - k + Nw
+            Z += W[k] @ Yp[:, s:s + T]
+        return Z
+
+    # ----- K-best sphere decoder (candidate generator) -----
+    def _ksphere_prepare(self, G0):
+        """QR of G0 (Nrx x Nt) with the strongest column decided first. Needs Nrx >= Nt."""
+        if G0.shape[0] < G0.shape[1]:
+            raise ValueError("Sphere-decoder candidates need Nr >= Nt.")
+        perm = np.argsort(np.linalg.norm(G0, axis=0))
+        Q, R = np.linalg.qr(G0[:, perm])
+        return perm, Q, R
+
+    def _ksphere(self, r, prep, K):
+        """
+        For every row r[p] (Nrx,) return the K joint symbols x with the smallest ||r - G0 x||^2
+        as found by breadth-first (K-best) sphere decoding: (P, K') joint indices, K' <= K.
+        The Nt antenna levels of the triangular system are searched top-down, keeping the K best
+        partial paths per level. Cost ~ P*K*M*Nt instead of P*M^Nt.
+        """
+        perm, Q, R = prep
+        Nt, M, P = R.shape[0], self.M, r.shape[0]
+        y = r @ Q.conj()                                   # y = Q^H r, shape (P, Nt)
+        pd = np.zeros((P, 1))
+        sel = np.zeros((P, 1, 0), dtype=int)
+        for lev in range(Nt - 1, -1, -1):
+            res = np.broadcast_to(y[:, lev, None], (P, 1))
+            if sel.shape[2]:
+                res = y[:, lev, None] - self.table[sel] @ R[lev, Nt - 1:lev:-1]
+            d = np.abs(res[:, :, None] - R[lev, lev] * self.table[None, None, :]) ** 2
+            flat = (pd[:, :, None] + d).reshape(P, -1)
+            k = min(K, flat.shape[1])
+            if k < flat.shape[1]:
+                idx = np.argpartition(flat, k - 1, axis=1)[:, :k]
+            else:
+                idx = np.broadcast_to(np.arange(k), (P, k))
+            pd = np.take_along_axis(flat, idx, axis=1)
+            parent, new = idx // M, idx % M
+            sel = np.concatenate([np.take_along_axis(sel, parent[:, :, None], axis=1),
+                                  new[:, :, None]], axis=2) if sel.shape[2] else new[:, :, None]
+        v = np.zeros(sel.shape[:2], dtype=np.int64)
+        for t in range(Nt):                                # decided order t <-> level Nt-1-t
+            v += sel[:, :, t] * M ** int(perm[Nt - 1 - t])
+        return v
+
+    # ----- detectors -----
+    def _mlse_flat(self, Z, G0, sv, n_cand):
+        """Memoryless (L = 1) joint ML detection, exact or with K-best sphere candidates."""
+        Mv, Nrx, T = sv.shape[0], Z.shape[0], Z.shape[1]
+        cont = sv @ G0.T                                   # (Mv, Nrx) noiseless output per joint symbol
+        En = np.sum(np.abs(cont) ** 2, axis=1)
+        prep = None if (n_cand is None or n_cand >= Mv) else self._ksphere_prepare(G0)
+        out = np.empty(T, dtype=np.int64)
+        step = max(1, (1 << 21) // (Mv if prep is None else n_cand * Nrx))
+        for a in range(0, T, step):
+            r = Z[:, a:a + step].T                          # (c, Nrx)
+            if prep is None:
+                out[a:a + step] = np.argmin(En[None, :] - 2 * (r.conj() @ cont.T).real, axis=1)
+            else:
+                cand = self._ksphere(r, prep, n_cand)
+                dist = np.sum(np.abs(r[:, None, :] - cont[cand]) ** 2, axis=2)
+                out[a:a + step] = np.take_along_axis(cand, dist.argmin(1)[:, None], 1)[:, 0]
+        return out
+
+    @staticmethod
+    def _isi_table(contrib, Mv, L, jlo, jhi):
+        """
+        Noiseless output of every trellis transition, shape (K, Mv, Mv, Nrx) with K = Mv^(L-2).
+        State after step n: s = v[n-1] + Mv*v[n-2] + ... (joint indices, newest = least significant).
+        A transition into s' = q*Mv + u (u = v[n]) comes from s = q + K*d, d = v[n-L+1] (the oldest
+        joint symbol, which leaves the state). Axes: (q, u, d). Only taps jlo..jhi are used; others
+        point before the first or after the last real symbol and are zero.
+        """
+        K = Mv ** (L - 2)
+        q = np.arange(K)
+        E = np.zeros((K, Mv, Mv, contrib.shape[2]), dtype=complex)
+        for j in range(jlo, jhi + 1):
+            if j == 0:
+                E += contrib[0][None, :, None, :]
+            elif j == L - 1:
+                E += contrib[j][None, None, :, :]
+            else:
+                E += contrib[j][(q // Mv ** (j - 1)) % Mv][:, None, None, :]
+        return E
+
+    def _mlse_viterbi(self, Z, contrib, Mv, L, T, depth, block):
+        """Full-state Viterbi with a bounded sliding-window traceback."""
+        Nrx, n_steps = Z.shape
+        S, K = Mv ** (L - 1), Mv ** (L - 2)
+        if depth == "full":
+            W = D = 0
+        else:
+            D = int(depth)
+            W = D + (D if block is None else int(block))
+        if W == 0 or W > n_steps:
+            W, D = n_steps, 0
+        B = W - D
+        buf = np.empty((W, S), dtype=np.min_scalar_type(Mv - 1))   # survivor decisions
+        out = np.empty(n_steps, dtype=np.min_scalar_type(Mv - 1))
+        zc = np.ascontiguousarray(np.concatenate([Z.real, Z.imag], axis=0).T)   # (n_steps, 2*Nrx)
+        pm = np.zeros(S)
+
+        def table(jlo, jhi):
+            E = self._isi_table(contrib, Mv, L, jlo, jhi)
+            return (np.concatenate([E.real, E.imag], axis=-1).reshape(-1, 2 * Nrx),
+                    (E.real ** 2 + E.imag ** 2).sum(-1).reshape(-1))
+
+        mid = table(0, L - 1)
+        filled = emitted = 0
+
+        def traceback(rows):
+            s = int(pm.argmin())
+            syms = np.empty(rows, dtype=out.dtype)
+            for r in range(rows - 1, -1, -1):
+                syms[r] = s % Mv
+                s = s // Mv + K * int(buf[r, s])
+            return syms
+
+        for n in range(n_steps):
+            jlo, jhi = max(0, n - T + 1), min(L - 1, n)
+            Ecat, En = mid if (jlo, jhi) == (0, L - 1) else table(jlo, jhi)
+            cand = (En - 2 * (Ecat @ zc[n])).reshape(K, Mv, Mv)   # |z|^2 dropped: same for all branches
+            cand += pm.reshape(Mv, K).T[:, None, :]
+            buf[filled] = cand.argmin(axis=2).reshape(S)
+            pm = cand.min(axis=2).reshape(S)
+            pm -= pm.min()
+            filled += 1
+            if filled == W and n + 1 < n_steps:
+                out[emitted:emitted + B] = traceback(W)[:B]
+                emitted += B
+                buf[:D] = buf[B:W]
+                filled = D
+        out[emitted:emitted + filled] = traceback(filled)
+        return out[:T].astype(np.int64)
+
+    def _mlse_malg(self, Z, G, sv, contrib, Mv, L, T, depth, block, n_keep, n_cand):
+        """
+        M-algorithm: keep only the n_keep best paths, merging paths that share the same last L-1
+        joint symbols. n_cand (optional) expands each path with only its n_cand best joint symbols,
+        found by the K-best sphere decoder, instead of all Mv. Memory is bounded by a sliding window:
+        (depth + block) x n_keep (parent, symbol) records.
+        """
+        Nrx, n_steps = Z.shape
+        if depth == "full":
+            W = D = 0
+        else:
+            D = int(depth)
+            W = D + (D if block is None else int(block))
+        if W == 0 or W > n_steps:
+            W, D = n_steps, 0
+        B = W - D
+        Kd = Mv ** (L - 2)
+        merge = Mv ** (L - 1) < 2 ** 62
+        use_sphere = n_cand is not None and n_cand < Mv
+        prep = self._ksphere_prepare(G[0]) if use_sphere else None
+        par = np.zeros((W, n_keep), dtype=np.min_scalar_type(n_keep))
+        sym = np.zeros((W, n_keep), dtype=np.min_scalar_type(Mv - 1))
+        out = np.empty(n_steps, dtype=np.min_scalar_type(Mv - 1))
+        pm = np.zeros(1)
+        hist = np.zeros((1, L - 1), dtype=np.int64)       # hist[:, j-1] = joint index of v[n-j]
+        key = np.zeros(1, dtype=np.int64)
+        filled = emitted = 0
+
+        def traceback(rows):
+            k = 0                                          # survivors are kept sorted: 0 is the best
+            syms = np.empty(rows, dtype=out.dtype)
+            for r in range(rows - 1, -1, -1):
+                syms[r] = sym[r, k]
+                k = int(par[r, k])
+            return syms
+
+        for n in range(n_steps):
+            jlo, jhi = max(0, n - T + 1), min(L - 1, n)
+            P = pm.size
+            r = np.broadcast_to(Z[:, n], (P, Nrx)).copy()
+            for j in range(max(1, jlo), jhi + 1):          # ISI from each path's own history
+                r -= contrib[j][hist[:, j - 1]]
+            if jlo == 0:
+                if use_sphere:
+                    cands = self._ksphere(r, prep, n_cand)             # (P, Kc)
+                    dd = r[:, None, :] - contrib[0][cands]
+                else:
+                    cands = np.broadcast_to(np.arange(Mv), (P, Mv))
+                    dd = r[:, None, :] - contrib[0][None, :, :]
+            else:                                          # past the last symbol: no new input
+                cands = np.zeros((P, 1), dtype=np.int64)
+                dd = r[:, None, :]
+            Kc = cands.shape[1]
+            tot = (pm[:, None] + (dd.real ** 2 + dd.imag ** 2).sum(-1)).ravel()
+            parent = np.repeat(np.arange(P), Kc)
+            v = np.ascontiguousarray(cands).ravel()
+            if merge:
+                nk = (key[parent] % Kd) * Mv + v
+                order = np.argsort(tot, kind="stable")
+                first = np.unique(nk[order], return_index=True)[1]
+                sel = order[np.sort(first)][:n_keep]
+            else:
+                sel = np.argsort(tot, kind="stable")[:n_keep]
+            pm = tot[sel]
+            pm = pm - pm[0]
+            P2 = sel.size
+            par[filled, :P2], sym[filled, :P2] = parent[sel], v[sel]
+            new_hist = np.empty((P2, L - 1), dtype=np.int64)
+            new_hist[:, 0] = v[sel]
+            new_hist[:, 1:] = hist[parent[sel], :L - 2]
+            hist = new_hist
+            if merge:
+                key = nk[sel]
+            filled += 1
+            if filled == W and n + 1 < n_steps:
+                out[emitted:emitted + B] = traceback(W)[:B]
+                emitted += B
+                par[:D], sym[:D] = par[B:W].copy(), sym[B:W].copy()
+                filled = D
+        out[emitted:emitted + filled] = traceback(filled)
+        return out[:T].astype(np.int64)
+
+    def mlse_detect_mimo(self, Y, H, tail=False, power_split=True, method="viterbi",
+                         depth=None, block=None, n_keep=None, n_cand=None,
+                         shorten=None, N0=None, n_ff=None, delay=None, max_states=1 << 16):
+        """
+        Sequence detection for Y[:, n] = sum_j H[:, :, j] x[:, n-j] + noise (V-BLAST symbols over a
+        frequency-selective MIMO channel; SISO is Nr = Nt = 1). Single carrier, no cyclic prefix,
+        known H of shape (Nr, Nt, L) as returned by MIMOLTapChannel, white noise.
+
+        Y     : (Nr, T) received samples (tail=False) or (Nr, T + L - 1) (tail=True).
+        method: "viterbi"  exact ML over a trellis of M^(Nt*(L-1)) states (guarded by max_states);
+                "malg"     M-algorithm: only the n_keep best paths survive (default 16), merging
+                           paths with identical last L-1 symbols; approximate ML.
+        n_cand: with method="malg" (or a memoryless channel) expand each path with only its n_cand
+                best joint symbols from a K-best sphere decoder instead of all M^Nt. Needs Nr >= Nt.
+        shorten: if given, first apply an MMSE-DFE-style prefilter (design_prefilter, needs N0) so
+                the trellis only needs `shorten` taps; n_ff / delay tune that filter.
+        depth, block: sliding-window traceback in symbols (default 8x the trellis memory); depth="full"
+                keeps every decision (exact, memory grows with T).
+        power_split : H is divided by sqrt(Nt), as the other MIMO methods do for the Coding_Schemes.
+
+        Returns the (Nt, T) array of detected constellation indices.
+        """
+        if self.waveform.name != "SC" or self.waveform.cyclic_prefix:
+            raise ValueError("MLSE needs single-carrier transmission without a cyclic prefix.")
+        method = str(method).lower()
+        if method not in ("viterbi", "malg"):
+            raise ValueError("method must be 'viterbi' or 'malg'.")
+        H = np.asarray(H, dtype=complex)
+        if H.ndim == 1:
+            H = H[None, None, :]
+        elif H.ndim == 2:
+            H = H[:, :, None]
+        Y = np.atleast_2d(np.asarray(Y, dtype=complex))
+        if H.ndim != 3 or Y.ndim != 2 or Y.shape[0] != H.shape[0] or Y.size == 0:
+            raise ValueError("Y must be (Nr, samples) and H must be (Nr, Nt, L) with the same Nr.")
+        if not (np.all(np.isfinite(H)) and np.all(np.isfinite(Y))):
+            raise ValueError("H and Y must be finite.")
+        Nr, Nt, L = H.shape
+        T = Y.shape[1] - (L - 1) if tail else Y.shape[1]
+        if T < 1:
+            raise ValueError("Y is too short for this many taps.")
+        for name, val in (("n_keep", n_keep), ("n_cand", n_cand)):
+            if val is not None and (int(val) != val or val < 1):
+                raise ValueError(f"{name} must be a positive integer.")
+        Mv = self.M ** Nt
+        Heff = H / np.sqrt(Nt) if power_split else H
+
+        if shorten is None:
+            G, Z, Leff, T_steps = np.transpose(Heff, (2, 0, 1)), Y, L, Y.shape[1]
+        else:
+            if N0 is None:
+                raise ValueError("shorten needs N0 to design the prefilter.")
+            pf = self.design_prefilter(Heff, N0, shorten, n_ff, delay, power_split=False)
+            Z = self._apply_prefilter(Y, pf["W"], pf["delay"], T)
+            G, Leff, T_steps = pf["B"], int(shorten), T
+
+        sv = self._joint_values(Nt)
+        if Leff == 1:
+            v = self._mlse_flat(Z[:, :T], G[0], sv, n_cand)
+        else:
+            if depth is None:
+                depth = 8 * Leff
+            elif depth != "full" and (int(depth) != depth or depth < Leff):
+                raise ValueError("depth must be an integer >= the trellis memory, or 'full'.")
+            if block is not None and (int(block) != block or block < 1):
+                raise ValueError("block must be a positive integer.")
+            contrib = np.einsum("jrt,vt->jvr", G, sv)      # (L, Mv, Nrx): output of tap j per joint symbol
+            if method == "viterbi":
+                if n_cand is not None or n_keep is not None:
+                    raise ValueError("n_keep / n_cand only apply to method='malg'.")
+                S = Mv ** (Leff - 1)
+                if S > max_states or S * Mv * Z.shape[0] > 1 << 22:
+                    raise ValueError(
+                        f"The trellis has M^(Nt*(L-1)) = {S} states with {Mv} branches each, which is "
+                        "too large for full Viterbi (raise max_states, or use method='malg', "
+                        "n_cand and/or shorten)."
+                    )
+                v = self._mlse_viterbi(Z[:, :T_steps], contrib, Mv, Leff, T, depth, block)
+            else:
+                v = self._mlse_malg(Z[:, :T_steps], G, sv, contrib, Mv, Leff, T, depth, block,
+                                    16 if n_keep is None else int(n_keep),
+                                    None if n_cand is None else int(n_cand))
+        return (v[None, :] // self.M ** np.arange(Nt)[:, None]) % self.M
+
+    def decode_mlse_mimo(self, Y, H, **kwargs):
+        """mlse_detect_mimo followed by the bit lookup (bits in V-BLAST stream order)."""
+        return self.bit_table[self._stream(self.mlse_detect_mimo(Y, H, **kwargs))].ravel()
+
+    # ---------- SISO wrappers ----------
+    def mlse_detect(self, y, h, tail=False, depth=None, block=None, max_states=1 << 16, **kwargs):
+        """
+        Viterbi MLSE for y[n] = sum_j h[j] x[n-j] + noise (SISO, single carrier, no CP, known taps).
+        len(y) = T (tail dropped, as in flow_test) or T + L - 1 with tail=True. depth / block set the
+        sliding-window traceback (default 8*L); depth="full" is exact but needs T x M^(L-1) bytes.
+        Extra keywords (method="malg", n_keep, n_cand, shorten, N0, ...) are passed on to
+        mlse_detect_mimo. Returns the (T,) array of constellation indices.
+        """
+        y = np.asarray(y, dtype=complex).ravel()
+        h = np.asarray(h, dtype=complex).ravel()
+        if h.size == 0 or y.size == 0:
+            raise ValueError("h and y must be non-empty.")
+        return self.mlse_detect_mimo(y[None, :], h[None, None, :], tail=tail, power_split=False,
+                                     depth=depth, block=block, max_states=max_states, **kwargs)[0]
+
+    def decode_mlse(self, y, h, **kwargs):
+        """Viterbi MLSE equalization followed by the bit lookup."""
+        return self.bit_table[self.mlse_detect(y, h, **kwargs)].ravel()
 
     # ---------- helpers ----------
     def bits_to_indices(self, bits):
