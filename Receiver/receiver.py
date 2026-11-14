@@ -14,7 +14,9 @@ class Receiver:
     (Y = H X + N, X of shape (n_tx, T)): scalar/MIMO ZF and MMSE, ordered SIC
     (V-BLAST), Alamouti combining and pilot-based channel estimation,
     Viterbi MLSE for single-carrier ISI channels, SISO or MIMO (mlse_detect, mlse_detect_mimo) with
-    reduced-state variants (M-algorithm, K-best sphere candidates, channel-shortening prefilter), plus
+    reduced-state variants (M-algorithm, K-best sphere candidates, channel-shortening prefilter),
+    time-domain ZF / MMSE linear and decision-feedback equalizers for single-carrier ISI channels
+    (equalize_sc, detect_sc), per-subcarrier MIMO-OFDM detection (ofdm_mimo_detect), plus
     non-coherent detection that needs neither the channel nor pilots:
     differential (DPSK, differential Alamouti), energy detection (OOK /
     amplitude levels) and orthogonal M-FSK.
@@ -896,6 +898,309 @@ class Receiver:
         """Viterbi MLSE equalization followed by the bit lookup."""
         return self.bit_table[self.mlse_detect(y, h, **kwargs)].ravel()
 
+    # ---------- Time-domain equalizers for single-carrier ISI channels ----------
+    # Model: Y[:, n] = sum_j H[:, :, j] x[:, n-j] + noise. Zero forcing (ZF) or MMSE, linear or
+    # decision feedback (DFE), SISO or MIMO. A filter window of n_ff taps looks at the received
+    # samples y[m+d-k], k = 0..n_ff-1 (d = look-ahead, chosen per transmit antenna); a DFE also
+    # subtracts the channel's response to the n_fb previous DECISIONS and, optionally, to the decisions
+    # already made for the other antennas at the same time step (spatial/V-BLAST-style feedback).
+
+    @staticmethod
+    def _stack_channel(H, Nw):
+        """
+        Block-Toeplitz Hs of shape (Nr*Nw, Nt*(Nw+L-1)) with  y_window = Hs @ x_window  (noise-free).
+        y_window[k*Nr:(k+1)*Nr] = y[m+d-k];  x_window block i (Nt entries) = x[m+d-i].
+        """
+        Nr, Nt, L = H.shape
+        nx = Nw + L - 1
+        Hs = np.zeros((Nr * Nw, Nt * nx), dtype=complex)
+        for k in range(Nw):
+            for l in range(L):
+                Hs[k * Nr:(k + 1) * Nr, (k + l) * Nt:(k + l + 1) * Nt] = H[:, :, l]
+        return Hs, nx
+
+    def design_equalizer(self, H, N0=None, kind="mmse", structure="linear", n_ff=None, n_fb=None,
+                         delay=None, spatial=None, order=None, power_split=True):
+        """
+        Design a time-domain equalizer for the channel H of shape (Nr, Nt, L) (a 1-D h is SISO).
+
+        kind     : "mmse" (needs N0) or "zf". ZF removes all ISI it can: the least-squares / minimum-
+                   norm FIR solution, so it is exact only when the filter has enough degrees of
+                   freedom (SISO DFE with n_fb >= L-1; MIMO needs Nr > Nt for a linear ZF).
+        structure: "linear" or "dfe". A DFE feeds back past decisions: the feedforward filter is
+                   designed so the response to the n_fb previous symbols (and to already-decided
+                   antennas, if spatial) can be cancelled instead of suppressed.
+        n_ff, n_fb: feedforward taps (default max(4L, 8)) and feedback taps (default L-1 for a DFE).
+        delay    : look-ahead in samples; None searches for the best one per antenna.
+        spatial  : DFE only (default: True for Nt > 1). Also cancel the same-time decisions of the
+                   antennas detected earlier; order=None chooses the order greedily (best first),
+                   or pass a permutation of range(Nt).
+        N0       : noise variance. For kind="zf" it is only used to pick the delay/order.
+
+        Note: a ZF-DFE has no spare degrees of freedom (its constraints exactly determine the
+        feedforward filter), so on channels with zeros outside the unit circle it needs a long
+        n_ff and still enhances noise badly; on a minimum-phase channel it reaches the AWGN
+        bound with feedback taps -h[1:]. The MMSE-DFE does not have this weakness.
+
+        Returns dict(W=(n_ff, Nt, Nr) feedforward taps, delay=(Nt,), Fb=(Nt, n_fb, Nt) feedback
+        taps, Sm=(Nt, Nt) spatial feedback, gain=(Nt,) gain on the desired symbol (for unbiasing),
+        order, score=(Nt,)). Detection with these is done by equalize_sc / detect_sc.
+        """
+        kind, structure = str(kind).lower(), str(structure).lower()
+        if kind not in ("zf", "mmse") or structure not in ("linear", "dfe"):
+            raise ValueError("kind must be 'zf' or 'mmse' and structure 'linear' or 'dfe'.")
+        H = np.asarray(H, dtype=complex)
+        if H.ndim == 1:
+            H = H[None, None, :]
+        elif H.ndim == 2:
+            H = H[:, :, None]
+        if H.ndim != 3:
+            raise ValueError("H must have shape (Nr, Nt, L).")
+        Nr, Nt, L = H.shape
+        A = self.constellation.A
+        if kind == "mmse" and (N0 is None or N0 < 0):
+            raise ValueError("MMSE equalization needs N0 >= 0.")
+        if kind == "zf" and Nr < Nt:
+            raise ValueError("Zero forcing needs Nr >= Nt.")
+        n0 = 0.01 * A if N0 is None else float(N0)
+        dfe = structure == "dfe"
+        n_fb = (L - 1 if dfe else 0) if n_fb is None else int(n_fb)
+        if n_fb < 0 or (n_fb and not dfe):
+            raise ValueError("n_fb must be a non-negative integer and is only used by a DFE.")
+        if spatial is None:
+            spatial = dfe and Nt > 1
+        if spatial and not dfe:
+            raise ValueError("Spatial feedback needs structure='dfe'.")
+        Nw = max(4 * L, 8) if n_ff is None else int(n_ff)
+        if Nw < 1:
+            raise ValueError("n_ff must be a positive integer.")
+        Hs, nx = self._stack_channel(H / np.sqrt(Nt) if power_split else H, Nw)
+        if nx - n_fb < 1:
+            raise ValueError("n_ff is too small for this many feedback taps.")
+        delays = range(nx - n_fb) if delay is None else [int(delay)]
+        if not all(0 <= d < nx - n_fb for d in delays):
+            raise ValueError("delay is out of range for n_ff and n_fb.")
+        dimY, ncol = Nr * Nw, Nt * nx
+        G = Hs @ Hs.conj().T
+
+        def solve(i, D):
+            """Best (score, delay, w, f, gain) for antenna i, with antennas D already decided."""
+            best = None
+            for d in delays:
+                tp = d * Nt + i
+                P = [(d + j) * Nt + l for j in range(1, n_fb + 1) for l in range(Nt)]
+                P += [d * Nt + l for l in D]
+                ht = Hs[:, tp]
+                if kind == "mmse":
+                    nP = len(P)
+                    Hp = Hs[:, P]
+                    R = np.zeros((dimY + nP, dimY + nP), dtype=complex)
+                    R[:dimY, :dimY] = A * G + n0 * np.eye(dimY)
+                    R[:dimY, dimY:] = A * Hp
+                    R[dimY:, :dimY] = A * Hp.conj().T
+                    R[dimY:, dimY:] = A * np.eye(nP)
+                    R += 1e-10 * A * np.eye(dimY + nP)
+                    rhs = np.concatenate([A * ht, np.zeros(nP)])
+                    theta = np.linalg.solve(R, rhs).conj()      # E[x|phi] = theta @ [y_window; fed-back x]
+                    score = A - (theta @ rhs).real              # MMSE
+                    w, f = theta[:dimY], theta[dimY:]
+                else:
+                    keep = np.ones(ncol, dtype=bool)
+                    keep[P] = False
+                    Hc = Hs[:, keep]
+                    t = np.zeros(Hc.shape[1])
+                    t[int(np.sum(keep[:tp]))] = 1.0
+                    w = t @ np.linalg.pinv(Hc)                  # min-norm / LS: w Hc = t (unit at x[m])
+                    res = w @ Hc - t
+                    score = n0 * np.vdot(w, w).real + A * np.vdot(res, res).real
+                    f = -(w @ Hs[:, P])                         # cancel the free (fed-back) columns
+                if best is None or score < best[0]:
+                    best = (score, d, w, f, w @ ht)
+            return best
+
+        chosen, D = {}, []
+        if spatial and order is None:
+            remaining = list(range(Nt))
+            while remaining:
+                cand = {i: solve(i, D) for i in remaining}
+                i = min(cand, key=lambda c: cand[c][0])
+                chosen[i] = (cand[i], list(D))
+                D.append(i)
+                remaining.remove(i)
+            order = D
+        else:
+            order = list(range(Nt)) if order is None else [int(o) for o in order]
+            if sorted(order) != list(range(Nt)):
+                raise ValueError("order must be a permutation of range(Nt).")
+            for i in order:
+                chosen[i] = (solve(i, D if spatial else []), list(D) if spatial else [])
+                if spatial:
+                    D.append(i)
+
+        W = np.zeros((Nw, Nt, Nr), dtype=complex)
+        Fb = np.zeros((Nt, n_fb, Nt), dtype=complex)
+        Sm = np.zeros((Nt, Nt), dtype=complex)
+        dl = np.zeros(Nt, dtype=int)
+        gain = np.zeros(Nt, dtype=complex)
+        score = np.zeros(Nt)
+        for i, ((sc, d, w, f, g), Di) in chosen.items():
+            W[:, i, :] = w.reshape(Nw, Nr)
+            if n_fb:
+                Fb[i] = f[:n_fb * Nt].reshape(n_fb, Nt)
+            for q, l in enumerate(Di):
+                Sm[i, l] = f[n_fb * Nt + q]
+            dl[i], gain[i], score[i] = d, g, sc
+        return {"W": W, "delay": dl, "Fb": Fb, "Sm": Sm, "gain": gain, "order": list(order),
+                "score": score, "kind": kind, "structure": structure, "spatial": bool(spatial)}
+
+    def _run_equalizer(self, Y, des, T, unbiased):
+        """Apply a designed equalizer to Y (Nr, samples): returns (soft (Nt, T), indices (Nt, T))."""
+        W, dl = des["W"], des["delay"]
+        Nw, Nt, Nr = W.shape
+        Yp = np.concatenate([np.zeros((Nr, Nw), dtype=complex), Y,
+                             np.zeros((Nr, int(dl.max())), dtype=complex)], axis=1)
+        Zff = np.zeros((Nt, T), dtype=complex)
+        for i in range(Nt):
+            for k in range(Nw):
+                s = int(dl[i]) - k + Nw
+                Zff[i] += W[k, i, :] @ Yp[:, s:s + T]
+        gain = des["gain"] if unbiased else np.ones(Nt)
+        Fb, Sm = des["Fb"], des["Sm"]
+        n_fb = Fb.shape[1]
+        if n_fb == 0 and not des["spatial"]:
+            soft = Zff / gain[:, None]
+            return soft, self._slice(soft)
+
+        soft = np.empty((Nt, T), dtype=complex)
+        idx = np.empty((Nt, T), dtype=int)
+        xh = np.zeros((Nt, T + n_fb), dtype=complex)      # decisions; column c is time c - n_fb
+        for m in range(T):
+            fb = (np.einsum("ijl,lj->i", Fb, xh[:, m:m + n_fb][:, ::-1]) if n_fb
+                  else np.zeros(Nt, dtype=complex))
+            for i in des["order"]:
+                z = (Zff[i, m] + fb[i] + Sm[i] @ xh[:, m + n_fb]) / gain[i]
+                k = int(np.argmin(np.abs(z - self.table) ** 2))
+                soft[i, m], idx[i, m], xh[i, m + n_fb] = z, k, self.table[k]
+        return soft, idx
+
+    def _sc_equalizer(self, Y, H, N0, tail, unbiased, **design_kw):
+        if self.waveform.name != "SC" or self.waveform.cyclic_prefix:
+            raise ValueError("Time-domain equalizers need single-carrier transmission without a "
+                             "cyclic prefix (use ofdm_mimo_detect for OFDM / SC with a CP).")
+        siso = np.ndim(Y) == 1 and np.ndim(H) == 1
+        H = np.asarray(H, dtype=complex)
+        if H.ndim == 1:
+            H = H[None, None, :]
+        elif H.ndim == 2:
+            H = H[:, :, None]
+        Y = np.atleast_2d(np.asarray(Y, dtype=complex))
+        if H.ndim != 3 or Y.ndim != 2 or Y.shape[0] != H.shape[0] or Y.size == 0:
+            raise ValueError("Y must be (Nr, samples) and H must be (Nr, Nt, L) with the same Nr.")
+        if not (np.all(np.isfinite(H)) and np.all(np.isfinite(Y))):
+            raise ValueError("H and Y must be finite.")
+        T = Y.shape[1] - (H.shape[2] - 1) if tail else Y.shape[1]
+        if T < 1:
+            raise ValueError("Y is too short for this many taps.")
+        des = self.design_equalizer(H, N0, **design_kw)
+        soft, idx = self._run_equalizer(Y, des, T, unbiased)
+        return (soft[0], idx[0]) if siso else (soft, idx)
+
+    def equalize_sc(self, Y, H, N0=None, tail=False, unbiased=True, **design_kw):
+        """
+        Equalized symbol estimates (before slicing) for a single-carrier ISI channel, shape (Nt, T)
+        (1-D for SISO input). design_kw: kind, structure, n_ff, n_fb, delay, spatial, order,
+        power_split (see design_equalizer). With a DFE these are the decision variables the slicer
+        saw, i.e. they already include the feedback. unbiased=True divides out the MMSE bias so QAM
+        can be sliced. With tail=False the last `delay` symbols miss their look-ahead samples and are
+        less reliable (use tail=True when the full convolution output is available).
+        """
+        return self._sc_equalizer(Y, H, N0, tail, unbiased, **design_kw)[0]
+
+    def detect_sc(self, Y, H, N0=None, tail=False, unbiased=True, **design_kw):
+        """Constellation indices from a time-domain ZF/MMSE linear or decision-feedback equalizer."""
+        return self._sc_equalizer(Y, H, N0, tail, unbiased, **design_kw)[1]
+
+    def decode_sc(self, Y, H, N0=None, tail=False, unbiased=True, **design_kw):
+        """Bits from detect_sc (V-BLAST stream order for MIMO)."""
+        idx = self.detect_sc(Y, H, N0, tail, unbiased, **design_kw)
+        return self.bit_table[idx if idx.ndim == 1 else self._stream(idx)].ravel()
+
+    # ---------- Per-subcarrier MIMO-OFDM (and single-carrier frequency-domain) detection ----------
+    def ofdm_mimo_detect(self, Y, H, N0=None, method="mmse", freq_domain=False, power_split=True,
+                         ordered=True, return_soft=False):
+        """
+        Detect V-BLAST streams over a frequency-selective MIMO channel with the receiver's OFDM
+        waveform (or single carrier with a cyclic prefix, i.e. SC-FDE): remove the CP, FFT, and run
+        the flat MIMO detector on every subcarrier with that subcarrier's channel matrix.
+
+        Y : (Nr, samples) received samples, whole blocks (CP included) per antenna.
+        H : time-domain taps (Nr, Nt, L) (needs L - 1 <= cyclic_prefix), or, with freq_domain=True,
+            the per-subcarrier responses (Nr, Nt, n_subcarriers) = FFT of the taps (unnormalised).
+        method : "zf", "mmse" (unbiased) or "sic" (ordered V-BLAST; OFDM only). N0 is needed for mmse;
+                 optional for sic (ZF nulling without it).
+        Returns the (Nt, T) detected indices, T = n_blocks * n_subcarriers in transmit order (1-D for
+        SISO input); with return_soft=True also the equalized symbols for zf / mmse.
+        """
+        wf = self.waveform
+        if wf.n_subcarriers is None:
+            raise ValueError("ofdm_mimo_detect needs an OFDM (or SC with cyclic prefix) waveform.")
+        method = str(method).lower()
+        if method not in ("zf", "mmse", "sic"):
+            raise ValueError("method must be 'zf', 'mmse' or 'sic'.")
+        if method == "sic" and wf.name != "OFDM":
+            raise ValueError("SIC is only available for OFDM; use zf or mmse for SC-FDE.")
+        if method == "mmse" and (N0 is None or N0 < 0):
+            raise ValueError("MMSE detection needs N0 >= 0.")
+        n = wf.n_subcarriers
+        siso = np.ndim(Y) == 1 and np.ndim(H) == 1
+        H = np.asarray(H, dtype=complex)
+        if H.ndim == 1:
+            H = H[None, None, :]
+        elif H.ndim == 2:
+            H = H[:, :, None]
+        Y = np.atleast_2d(np.asarray(Y, dtype=complex))
+        if H.ndim != 3 or Y.ndim != 2 or Y.shape[0] != H.shape[0] or Y.size == 0:
+            raise ValueError("Y must be (Nr, samples) and H must be (Nr, Nt, L) with the same Nr.")
+        if freq_domain:
+            if H.shape[2] != n:
+                raise ValueError("With freq_domain=True, H must be (Nr, Nt, n_subcarriers).")
+            Hf = H
+        else:
+            if H.shape[2] - 1 > wf.cyclic_prefix:
+                raise ValueError("The channel memory L-1 exceeds the cyclic prefix; per-subcarrier "
+                                 "equalization would leave ISI.")
+            Hf = np.fft.fft(H, n, axis=2)
+        Nr, Nt = Hf.shape[:2]
+        Yd = np.vstack([wf.demodulate(row) for row in Y])        # CP removed (+ FFT for OFDM)
+        if wf.name == "OFDM":
+            Yf = Yd
+        else:
+            Yf = (np.fft.fft(Yd.reshape(Nr, -1, n), axis=2) / np.sqrt(n)).reshape(Nr, -1)
+        T = Yf.shape[1]
+        plain = Receiver(self.constellation)                      # flat detectors, no demodulation
+        soft = np.zeros((Nt, T), dtype=complex)
+        idx = np.zeros((Nt, T), dtype=int)
+        for k in range(n):
+            Yk, Hk = Yf[:, k::n], Hf[:, :, k]
+            if method == "zf":
+                soft[:, k::n] = plain.zf_mimo(Yk, Hk, power_split)
+            elif method == "mmse":
+                soft[:, k::n] = plain.mmse_mimo(Yk, Hk, N0, power_split, unbiased=True)
+            else:
+                idx[:, k::n] = plain.sic_vblast(Yk, Hk, N0, power_split, ordered)[0]
+        if method != "sic":
+            if wf.name == "SC":                                  # SC-FDE: back to the time domain
+                soft = (np.fft.ifft(soft.reshape(Nt, -1, n), axis=2) * np.sqrt(n)).reshape(Nt, -1)
+            idx = self._slice(soft)
+        if siso:
+            soft, idx = soft[0], idx[0]
+        return (idx, soft) if return_soft and method != "sic" else idx
+
+    def decode_ofdm_mimo(self, Y, H, **kwargs):
+        """Bits from ofdm_mimo_detect (V-BLAST stream order for MIMO)."""
+        idx = self.ofdm_mimo_detect(Y, H, **kwargs)
+        return self.bit_table[idx if idx.ndim == 1 else self._stream(idx)].ravel()
+
     # ---------- helpers ----------
     def bits_to_indices(self, bits):
         """Group bits into chunks of k and turn each chunk into an integer."""
@@ -1036,4 +1341,5 @@ def monte_carlo(constellation, channel, EbN0_dB, n_bits=100_000, n_trials=20, se
         out["ser_var"].append(np.var(sers, ddof=1))
 
     return {key: np.array(v) for key, v in out.items()}
+
 
