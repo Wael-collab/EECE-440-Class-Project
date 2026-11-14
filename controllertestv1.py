@@ -33,6 +33,26 @@ MODES = [
 
 BER_FLOOR = 1e-8  # used only for plotting zero-error points on log axes
 
+# Multi-tap (frequency-selective) channel
+MULTITAP = "Multi-Tap Channel"
+SISO_ISI_MODE = "SISO (ISI equalization)"
+VITERBI = "Viterbi (MLSE)"
+# Equalizer name -> (kind, structure) for Receiver.detect_sc; None = Viterbi.
+EQUALIZERS = {
+    VITERBI: None,
+    "Linear MMSE": ("mmse", "linear"),
+    "Linear ZF": ("zf", "linear"),
+    "DFE (MMSE)": ("mmse", "dfe"),
+    "DFE (ZF)": ("zf", "dfe"),
+}
+DEFAULT_EQUALIZERS = [VITERBI, "Linear MMSE", "Linear ZF", "DFE (MMSE)"]
+TAP_MODELS = ["Rayleigh fading taps", "Fixed taps"]
+DEFAULT_FIXED_TAPS = "0.407, 0.815, 0.407"   # Proakis channel B
+# Same trellis limits as Receiver.mlse_detect_mimo (max_states and the
+# S * M * Nr <= 2^22 check), so the dialog rejects what the receiver would.
+MAX_TRELLIS_STATES = 1 << 16
+MAX_TRELLIS_BRANCHES = 1 << 22
+
 
 def modulation_orders(constellation):
     if constellation == "PAM":
@@ -73,8 +93,14 @@ def check_mimo_mode(channel):
     return True
 
 
-def display_bit_comparison(bits, decoded_bits, num_rows, N, row_label="Transmitter"):
-    """Display sent/decoded bits; rows can be transmitters or receivers."""
+def display_bit_comparison(bits, decoded_bits, num_rows, N, row_label="Transmitter",
+                           row_names=None):
+    """
+    Display sent/decoded bits; rows can be transmitters or receivers.
+    row_names (optional) replaces the default "<row_label> i" row titles.
+    """
+    if row_names is None:
+        row_names = [f"{row_label} {i+1}" for i in range(num_rows)]
     st.subheader("Transmitted and Received Bits")
     display_bits = min(int(N), 500)
     st.caption(
@@ -96,7 +122,7 @@ def display_bit_comparison(bits, decoded_bits, num_rows, N, row_label="Transmitt
     for i in range(num_rows):
         table += (
             "<tr><td rowspan='2' style='padding:8px;border:1px solid #888;'>"
-            f"{row_label} {i+1}</td>"
+            f"{row_names[i]}</td>"
             "<td style='padding:8px;border:1px solid #888;'>Transmitted</td>"
         )
         for j in range(display_bits):
@@ -129,6 +155,15 @@ def display_timing_breakdown(timings, caption):
     st.caption(caption)
 
 
+def channel_prefix(channel):
+    """Session-state key prefix for each channel's settings and results."""
+    if channel == "AWGN":
+        return ""
+    if channel == MULTITAP:
+        return "multitap_"
+    return f"{channel.lower()}_"
+
+
 def clear_session_keys(keys):
     for key in keys:
         st.session_state.pop(key, None)
@@ -148,6 +183,15 @@ def clear_simulation_results():
     clear_session_keys(result_keys(""))
     clear_session_keys(result_keys("rician_"))
     clear_session_keys(result_keys("rayleigh_"))
+    clear_session_keys(result_keys("multitap_"))
+    clear_session_keys([
+        "multitap_transmitters", "multitap_receivers", "multitap_c",
+        "multitap_constellation_type", "multitap_M_value",
+        "multitap_A_value", "multitap_N_value", "multitap_N0_value",
+        "multitap_repetitions_value", "multitap_tap_model_value",
+        "multitap_L_value", "multitap_pdp_value", "multitap_decay_db_value",
+        "multitap_fixed_taps_value", "multitap_equalizers_value",
+    ])
     clear_session_keys([
         "transmitters", "receivers", "c", "constellation", "M", "A", "N", "N0",
         "rician_transmitters", "rician_receivers", "rician_c",
@@ -196,6 +240,280 @@ def decoded_vector(raw_bits, N):
     return result
 
 
+# ============================================================
+# MULTI-TAP (FREQUENCY-SELECTIVE) CHANNEL
+# ============================================================
+
+def tap_powers(L, pdp="Uniform", decay_db=0.0):
+    """Average tap powers E|h_l|^2, normalized so they sum to 1."""
+    L = int(L)
+    if pdp == "Exponential":
+        p = 10.0 ** (-float(decay_db) * np.arange(L) / 10.0)
+    else:
+        p = np.ones(L)
+    return p / p.sum()
+
+
+def parse_taps(text):
+    """Read comma-separated tap coefficients and scale them to unit energy."""
+    parts = [
+        part.strip() for part in str(text).replace(";", ",").split(",")
+        if part.strip()
+    ]
+    if len(parts) < 2:
+        raise ValueError(
+            "Enter at least 2 tap coefficients, separated by commas."
+        )
+    try:
+        taps = np.array([
+            complex(part.replace(" ", "").replace("i", "j")) for part in parts
+        ])
+    except ValueError:
+        raise ValueError(
+            "Could not read the tap coefficients; use numbers such as "
+            "0.8 or 0.3-0.1j."
+        ) from None
+    energy = float(np.sum(np.abs(taps) ** 2))
+    if not np.isfinite(energy) or energy == 0:
+        raise ValueError("The taps must be finite and not all zero.")
+    return taps / np.sqrt(energy)
+
+
+def format_complex(z):
+    z = complex(z)
+    if abs(z.imag) < 1e-12:
+        return f"{z.real:.4g}"
+    return f"{z.real:.3f}{z.imag:+.3f}j"
+
+
+def draw_multitap_taps():
+    """Channel taps h (L,) for one realization, from the dialog settings."""
+    state = st.session_state
+    if state.multitap_tap_model_value == "Fixed taps":
+        return np.asarray(state.multitap_fixed_taps_value, dtype=complex)
+
+    powers = tap_powers(
+        state.multitap_L_value,
+        state.multitap_pdp_value,
+        state.multitap_decay_db_value,
+    )
+    gaussian = (
+        np.random.randn(powers.size) + 1j * np.random.randn(powers.size)
+    )
+    return np.sqrt(powers / 2.0) * gaussian
+
+
+def multitap_channel(symbols, taps, N0):
+    """
+    y[n] = sum_l h[l] x[n-l] + w[n], n = 0 .. T + L - 2.
+
+    The full convolution is kept, including the L - 1 tail samples, so the
+    Viterbi detector can use them (mlse_detect(..., tail=True)). Noise is
+    added with the same AWGN_Channel as the other channels, so N0 means
+    the same thing everywhere.
+    """
+    clean = np.convolve(np.asarray(symbols).ravel(), np.asarray(taps))
+    return np.asarray(AWGN_Channel(clean[None, :], N0)).reshape(-1)
+
+
+def detect_multitap(receiver, equalizer, received, taps, N0):
+    """
+    Detected symbol indices (T,) from one equalizer.
+
+    The receiver is handed the taps of the CURRENT realization, so every
+    equalizer is redesigned for each new channel (perfect CSI):
+        Viterbi (MLSE)          -> Receiver.mlse_detect
+        Linear / DFE, ZF / MMSE -> Receiver.detect_sc (time-domain FIR
+                                   equalizer designed for these taps)
+    received is the full convolution output (T + L - 1 samples), hence
+    tail=True for both.
+    """
+    spec = EQUALIZERS[equalizer]
+    if spec is None:
+        return receiver.mlse_detect(received, taps, tail=True)
+    kind, structure = spec
+    return receiver.detect_sc(
+        received, taps, N0=N0, tail=True, kind=kind, structure=structure,
+    )
+
+
+def ber_from_detected_symbols(receiver, detected, tx_bits):
+    """
+    Turn an equalizer's detected symbols into bits and count bit errors.
+
+    detected: symbol indices, as returned by Receiver.mlse_detect and
+              Receiver.detect_sc (table index = bit label). Complex or real symbol values
+              are also accepted and are sliced to the nearest
+              constellation point first.
+    tx_bits:  the transmitted bits of the same frame.
+
+    Returns (decoded_bits, n_errors, ber).
+    """
+    detected = np.asarray(detected).ravel()
+    if not np.issubdtype(detected.dtype, np.integer):
+        detected = receiver._slice(detected)
+
+    decoded_bits = receiver.bit_table[detected].ravel()
+    tx_bits = np.asarray(tx_bits, dtype=int).ravel()
+    if decoded_bits.size != tx_bits.size:
+        raise ValueError(
+            f"Equalizer returned {decoded_bits.size} bits; "
+            f"expected {tx_bits.size}."
+        )
+
+    n_errors = int(np.count_nonzero(decoded_bits != tx_bits))
+    return decoded_bits, n_errors, n_errors / tx_bits.size
+
+
+def run_multitap_simulation(transmitters, receivers, N, N0, repetitions=1):
+    """
+    SISO single-carrier link over a frequency-selective (multi-tap)
+    channel, equalized with each selected equalizer.
+
+    For each realization:
+        bits -> symbols x (T,) -> new taps h -> y = h * x + noise
+        (length T + L - 1) -> for every selected equalizer:
+        detect_multitap(receiver, eq, y, h, N0) -> bits -> bit errors
+
+    The taps stay fixed over a frame and are redrawn every realization
+    (block fading). The receiver is given the new taps every time, and all
+    equalizers see exactly the same bits, taps and noise, so their BERs
+    are directly comparable. BER = total errors / total bits per equalizer.
+    """
+    N = int(N)
+    repetitions = int(repetitions)
+    transmitter, receiver = transmitters[0], receivers[0]
+    equalizers = list(st.session_state.multitap_equalizers_value)
+    n_eq = len(equalizers)
+
+    k = int(receiver.k)
+    if N % k:
+        raise ValueError(f"N={N} must be divisible by k={k}.")
+    num_symbols = N // k
+
+    total_errors = np.zeros(n_eq, dtype=np.int64)
+    decoded = np.zeros((n_eq, N), dtype=int)
+    timings = {
+        "Bit generation": 0.0,
+        "Transmitter modulation": 0.0,
+        "Channel tap generation": 0.0,
+        "Channel transmission (convolution + noise)": 0.0,
+    }
+    for eq in equalizers:
+        timings[f"Detection: {eq}"] = 0.0
+    timings["BER calculation"] = 0.0
+    simulation_start = time.perf_counter()
+
+    for _ in range(repetitions):
+        start = time.perf_counter()
+        bits = np.random.randint(0, 2, size=N)
+        timings["Bit generation"] += time.perf_counter() - start
+
+        start = time.perf_counter()
+        symbols = np.asarray(transmitter.run(bits, N)).ravel()
+        if symbols.size != num_symbols:
+            raise ValueError(
+                f"Transmitter returned {symbols.size} symbols; "
+                f"expected {num_symbols}."
+            )
+        timings["Transmitter modulation"] += time.perf_counter() - start
+
+        start = time.perf_counter()
+        taps = draw_multitap_taps()          # new h for this realization
+        timings["Channel tap generation"] += time.perf_counter() - start
+
+        start = time.perf_counter()
+        received = multitap_channel(symbols, taps, N0)
+        timings["Channel transmission (convolution + noise)"] += (
+            time.perf_counter() - start
+        )
+
+        for e, eq in enumerate(equalizers):
+            start = time.perf_counter()
+            detected = detect_multitap(receiver, eq, received, taps, N0)
+            timings[f"Detection: {eq}"] += time.perf_counter() - start
+
+            start = time.perf_counter()
+            decoded[e], n_errors, _ = ber_from_detected_symbols(
+                receiver, detected, bits
+            )
+            total_errors[e] += n_errors
+            timings["BER calculation"] += time.perf_counter() - start
+
+    timings["Total simulation time"] = time.perf_counter() - simulation_start
+
+    total_bits = np.full(n_eq, repetitions * N, dtype=np.int64)
+    return {
+        "bits": np.tile(bits, (n_eq, 1)),
+        "samples": symbols[None, :],
+        "received": received[None, :],
+        "decoded_bits": decoded.copy(),
+        "ber": total_errors / total_bits,
+        "H": taps,
+        "timings": timings,
+        "error_counts": total_errors,
+        "total_bits": total_bits,
+    }
+
+
+def is_fixed_multitap(channel):
+    """True for the multi-tap channel with fixed taps (one deterministic channel)."""
+    return (
+        channel == MULTITAP
+        and st.session_state.get("multitap_tap_model_value") == "Fixed taps"
+    )
+
+
+def multitap_summary():
+    """One-line description of the configured multi-tap channel."""
+    state = st.session_state
+    L = int(state.multitap_L_value)
+    M = int(state.multitap_M_value)
+    if state.multitap_tap_model_value == "Fixed taps":
+        taps = ", ".join(
+            format_complex(t) for t in state.multitap_fixed_taps_value
+        )
+        channel = f"fixed taps h = [{taps}] (unit energy)"
+    else:
+        if state.multitap_pdp_value == "Exponential":
+            profile = (
+                f"exponential power-delay profile, "
+                f"{state.multitap_decay_db_value:g} dB/tap"
+            )
+        else:
+            profile = "uniform power-delay profile"
+        channel = (
+            f"{L} Rayleigh fading taps, {profile} (unit total power)"
+        )
+    equalizers = list(state.multitap_equalizers_value)
+    text = f"Channel: {channel}. Equalizers: {', '.join(equalizers)}"
+    if VITERBI in equalizers:
+        text += f" (Viterbi trellis: {M ** (L - 1):,} states)"
+    return text + "."
+
+
+def display_multitap_taps(taps):
+    """Table of the channel taps used in the last realization."""
+    taps = np.asarray(taps, dtype=complex).ravel()
+    state = st.session_state
+    st.subheader(
+        "Channel Taps" if state.multitap_tap_model_value == "Fixed taps"
+        else "Channel Taps (last realization)"
+    )
+    table = {
+        "Tap l": list(range(taps.size)),
+        "h_l": [format_complex(t) for t in taps],
+        "|h_l|^2": [float(abs(t) ** 2) for t in taps],
+    }
+    if state.multitap_tap_model_value != "Fixed taps":
+        table["Average power E|h_l|^2"] = list(tap_powers(
+            state.multitap_L_value,
+            state.multitap_pdp_value,
+            state.multitap_decay_db_value,
+        ))
+    st.dataframe(table)
+
+
 def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0):
     """
     Simulation modes:
@@ -223,7 +541,15 @@ def run_simulation(channel, transmitters, receivers, N, N0, repetitions=1, K=0.0
 
     For Rayleigh/Rician, BER is computed as total errors / total bits
     over the user-selected number of independent channel realizations.
+
+    Multi-Tap Channel: handled by run_multitap_simulation (SISO,
+    Viterbi MLSE equalizer).
     """
+    if channel == MULTITAP:
+        return run_multitap_simulation(
+            transmitters, receivers, N, N0, repetitions
+        )
+
     mode = st.session_state.mimo_mode
     numtx = int(st.session_state.numtx)
     numrx = int(st.session_state.numrx)
@@ -475,7 +801,10 @@ def run_sweep(channel, transmitters, receivers, N, A, snr_db_list,
     numtx = int(st.session_state.numtx)
     numrx = int(st.session_state.numrx)
 
-    num_results = numrx if mode == "Transmit Diversity" else numtx
+    if channel == MULTITAP:
+        num_results = len(st.session_state.multitap_equalizers_value)
+    else:
+        num_results = numrx if mode == "Transmit Diversity" else numtx
     ber_per_stream = [[] for _ in range(num_results)]
     ber_avg = []
 
@@ -524,7 +853,7 @@ def store_results(prefix, results):
 
 
 def initialize_modems(channel):
-    prefix = "" if channel == "AWGN" else f"{channel.lower()}_"
+    prefix = channel_prefix(channel)
     tx_key = f"{prefix}transmitters"
     rx_key = f"{prefix}receivers"
 
@@ -574,7 +903,7 @@ def initialize_modems(channel):
 
 
 def display_simulation_results(channel):
-    prefix = "" if channel == "AWGN" else f"{channel.lower()}_"
+    prefix = channel_prefix(channel)
     state = st.session_state
 
     if f"{prefix}received" not in state:
@@ -587,6 +916,13 @@ def display_simulation_results(channel):
 
     labels = "Receiver" if mode == "Transmit Diversity" else "Transmitter"
     num_results = numrx if mode == "Transmit Diversity" else numtx
+    row_names = None
+    if channel == MULTITAP:
+        row_names = list(state.multitap_equalizers_value)
+        num_results = len(row_names)
+        labels = "Equalizer"
+    else:
+        row_names = [f"{labels} {i+1}" for i in range(num_results)]
 
     st.subheader(f"{channel} Simulation Results")
 
@@ -596,7 +932,11 @@ def display_simulation_results(channel):
         st.write("Channel model: Rayleigh fading (K = 0)")
 
     if channel != "AWGN":
-        st.write("Detection mode: Coherent (Perfect CSI)")
+        st.write(
+            "Detection mode: equalizers redesigned for the known taps of "
+            "every realization (Perfect CSI)"
+            if channel == MULTITAP else "Detection mode: Coherent (Perfect CSI)"
+        )
         st.write(
             f"Noise power spectral density (N0): "
             f"{state[f'{prefix}N0_value']:.6f}"
@@ -609,10 +949,11 @@ def display_simulation_results(channel):
             f"Modulation: {state[f'{prefix}constellation_type']}, "
             f"M = {state[f'{prefix}M_value']}"
         )
-        st.write(
-            "Independent channel realizations: "
-            f"{state[f'{prefix}repetitions_value']}"
-        )
+        if not is_fixed_multitap(channel):
+            st.write(
+                "Independent channel realizations: "
+                f"{state[f'{prefix}repetitions_value']}"
+            )
         st.write(
             f"Total tested bits per {labels.lower()}: "
             f"{state[f'{prefix}total_bits'][0]:,}"
@@ -642,6 +983,17 @@ def display_simulation_results(channel):
             "underdetermined and cannot generally separate the streams."
         )
 
+    elif channel == MULTITAP:
+        st.info(
+            "Multi-tap channel: one transmitter and one receiver. Each "
+            "frame is convolved with the channel taps (intersymbol "
+            "interference) and noise is added. The receiver is given the "
+            "taps and each selected equalizer recovers the symbols; all "
+            "equalizers process the same frames. "
+            + multitap_summary()
+        )
+        display_multitap_taps(state[f"{prefix}H"])
+
     timing_key = "simulation_timings" if not prefix else f"{prefix}timings"
 
     display_timing_breakdown(
@@ -649,11 +1001,11 @@ def display_simulation_results(channel):
         "Computational time only; browser rendering is excluded. "
         + (
             "Timings are accumulated across all channel realizations."
-            if channel != "AWGN" else ""
+            if channel != "AWGN" and not is_fixed_multitap(channel) else ""
         ),
     )
 
-    if channel != "AWGN":
+    if channel != "AWGN" and not is_fixed_multitap(channel):
         st.caption(
             "The bit comparison below is from the last channel "
             "realization; the BER values use all channel realizations."
@@ -665,26 +1017,34 @@ def display_simulation_results(channel):
         num_results,
         N,
         row_label=labels,
+        row_names=row_names,
     )
 
     st.subheader(
         "Monte Carlo BER (Averaged over channel realizations)"
-        if channel != "AWGN" else "Bit Error Rates"
+        if channel != "AWGN" and not is_fixed_multitap(channel)
+        else "Bit Error Rates"
     )
 
-    for i, value in enumerate(state[f"{prefix}ber"]):
-        st.metric(f"BER - {labels} {i+1}", f"{value:.6f}")
+    if channel == MULTITAP:
+        columns = st.columns(num_results)
+        for i, value in enumerate(state[f"{prefix}ber"]):
+            with columns[i]:
+                st.metric(f"BER - {row_names[i]}", f"{value:.6f}")
+    else:
+        for i, value in enumerate(state[f"{prefix}ber"]):
+            st.metric(f"BER - {labels} {i+1}", f"{value:.6f}")
 
-    st.metric(
-        "Overall Average BER",
-        f"{np.mean(state[f'{prefix}ber']):.6f}"
-    )
+        st.metric(
+            "Overall Average BER",
+            f"{np.mean(state[f'{prefix}ber']):.6f}"
+        )
 
     if channel != "AWGN":
         st.subheader("Error Statistics")
         for i in range(num_results):
             st.write(
-                f"**{labels} {i+1}:** "
+                f"**{row_names[i]}:** "
                 f"{state[f'{prefix}error_counts'][i]:,} errors out of "
                 f"{state[f'{prefix}total_bits'][i]:,} bits"
             )
@@ -692,7 +1052,7 @@ def display_simulation_results(channel):
 
 def display_sweep_results(channel):
     """Render the BER-vs-SNR sweep curve and raw data."""
-    prefix = "" if channel == "AWGN" else f"{channel.lower()}_"
+    prefix = channel_prefix(channel)
     state = st.session_state
 
     if f"{prefix}sweep_results" not in state:
@@ -716,6 +1076,8 @@ def display_sweep_results(channel):
         st.write(f"Rician K-factor (linear): {state.rician_K_value}")
     elif channel == "Rayleigh":
         st.write("Channel model: Rayleigh fading (K = 0)")
+    elif channel == MULTITAP:
+        st.write(multitap_summary())
 
     if channel == "AWGN":
         st.write(
@@ -727,10 +1089,16 @@ def display_sweep_results(channel):
         )
         st.write(f"Average symbol energy (A): {state.A:.6f}")
     else:
-        st.write(
-            "Channel realizations per SNR point: "
-            f"{state[f'{prefix}repetitions_value']}"
-        )
+        if is_fixed_multitap(channel):
+            st.write(
+                f"Bits per SNR point: {state[f'{prefix}N_value']:,} "
+                "(fixed taps, one frame)"
+            )
+        else:
+            st.write(
+                "Channel realizations per SNR point: "
+                f"{state[f'{prefix}repetitions_value']}"
+            )
         st.write(
             f"Average symbol energy (A): "
             f"{state[f'{prefix}A_value']:.6f}"
@@ -765,12 +1133,13 @@ def display_sweep_results(channel):
                 marker="o", linewidth=1.8,
                 label=labels[i],
             )
-        ber_avg_plot = [max(b, BER_FLOOR) for b in ber_avg]
-        ax.semilogy(
-            snr_db, ber_avg_plot,
-            marker="s", linewidth=2.2, linestyle="--",
-            color="black", label="Average BER",
-        )
+        if channel != MULTITAP:
+            ber_avg_plot = [max(b, BER_FLOOR) for b in ber_avg]
+            ax.semilogy(
+                snr_db, ber_avg_plot,
+                marker="s", linewidth=2.2, linestyle="--",
+                color="black", label="Average BER",
+            )
         ax.legend(loc="best")
 
     ax.set_xlabel("SNR (Es/N0) [dB]")
@@ -794,7 +1163,7 @@ def display_sweep_results(channel):
     table = {"SNR (Es/N0) [dB]": snr_db}
     for i, ber_list in enumerate(ber_per_stream):
         table[f"{labels[i]} BER"] = ber_list
-    if len(ber_per_stream) > 1:
+    if len(ber_per_stream) > 1 and channel != MULTITAP:
         table["Average BER"] = ber_avg
     st.dataframe(table)
 
@@ -830,6 +1199,13 @@ def simulation_popup():
             "Diversity modes apply to fading channels."
         )
         mimo_mode = "Spatial Multiplexing (ZF)"
+    elif channel == MULTITAP:
+        st.info(
+            "The multi-tap channel is simulated with 1 transmitter and "
+            "1 receiver. The channel taps and the equalizers (Viterbi, "
+            "linear, ZF, DFE) are set in the next dialog."
+        )
+        mimo_mode = SISO_ISI_MODE
     else:
         mimo_mode = st.selectbox(
             "MIMO Transmission Mode",
@@ -839,7 +1215,10 @@ def simulation_popup():
         )
 
     # In sweep mode, diversity modes collapse to a single BER curve.
-    if sweep and mimo_mode == "Receive Diversity":
+    if channel == MULTITAP:
+        numtx = 1
+        numrx = 1
+    elif sweep and mimo_mode == "Receive Diversity":
         st.info(
             "Sweep mode: Receive Diversity uses exactly 1 transmitter "
             "so that one BER curve is produced."
@@ -914,6 +1293,7 @@ def simulation_popup():
         clear_session_keys([
             "channel", "numtx", "numrx", "mimo_mode",
             "awgn_configured", "rician_configured", "rayleigh_configured",
+            "multitap_configured",
         ])
 
         st.session_state.channel = channel
@@ -971,6 +1351,7 @@ if "channel" in st.session_state:
         clear_session_keys([
             "channel", "numtx", "numrx", "mimo_mode",
             "awgn_configured", "rician_configured", "rayleigh_configured",
+            "multitap_configured",
             "sweep_mode",
         ])
 
@@ -1266,12 +1647,278 @@ def rayleigh_popup():
     fading_popup("Rayleigh")
 
 
+@st.dialog("Multi-Tap Channel Simulation Parameters")
+def multitap_popup():
+    """Parameters for the frequency-selective channel and its equalizers."""
+    prefix = "multitap_"
+    sweep = st.session_state.get("sweep_mode", False)
+
+    st.write("Please select Multi-Tap Channel parameters")
+
+    constellation = st.selectbox(
+        "Constellation Type",
+        ["PAM", "QAM", "PSK"],
+        key=f"{prefix}constellation",
+    )
+
+    M = st.selectbox(
+        "Modulation Order (M)",
+        modulation_orders(constellation),
+        key=f"{prefix}M",
+    )
+
+    A = st.number_input(
+        "Average Symbol Energy (A)",
+        min_value=0.000001,
+        value=1.0,
+        step=0.5,
+        key=f"{prefix}A",
+    )
+
+    st.divider()
+
+    N = st.number_input(
+        "Message Length (number of bits per frame)",
+        min_value=1,
+        value=64,
+        step=1,
+        key=f"{prefix}N",
+    )
+
+    # ---------------- channel taps ----------------
+    st.subheader("Multipath Channel")
+    tap_model = st.radio(
+        "Tap Model",
+        TAP_MODELS,
+        horizontal=True,
+        key=f"{prefix}tap_model",
+        help=(
+            "Rayleigh fading taps: new complex Gaussian taps every channel "
+            "realization. Fixed taps: the same deterministic ISI channel "
+            "every realization."
+        ),
+    )
+
+    pdp = "Uniform"
+    decay_db = 0.0
+    fixed_taps = None
+
+    if tap_model == "Rayleigh fading taps":
+        L = st.number_input(
+            "Number of Taps (L)",
+            min_value=2,
+            max_value=10,
+            value=3,
+            step=1,
+            key=f"{prefix}L",
+        )
+        pdp = st.selectbox(
+            "Power-Delay Profile",
+            ["Uniform", "Exponential"],
+            key=f"{prefix}pdp",
+        )
+        if pdp == "Exponential":
+            decay_db = st.number_input(
+                "Power Decay per Tap (dB)",
+                min_value=0.0,
+                value=3.0,
+                step=1.0,
+                key=f"{prefix}decay_db",
+            )
+        powers = tap_powers(L, pdp, decay_db)
+        st.caption(
+            "Average tap powers E|h_l|^2: "
+            + ", ".join(f"{p:.3f}" for p in powers)
+            + " (sum = 1, so the average received symbol energy is A)."
+        )
+    else:
+        tap_text = st.text_input(
+            "Tap Coefficients h_0, h_1, ... (comma-separated)",
+            value=DEFAULT_FIXED_TAPS,
+            key=f"{prefix}fixed_taps",
+            help="Complex taps are allowed, e.g. 0.8, 0.5+0.2j, -0.1j.",
+        )
+        try:
+            fixed_taps = parse_taps(tap_text)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        L = fixed_taps.size
+        st.caption(
+            "Scaled to unit energy: h = ["
+            + ", ".join(format_complex(t) for t in fixed_taps)
+            + "]."
+        )
+
+    L = int(L)
+
+    # ---------------- equalizers ----------------
+    st.subheader("Equalizers")
+    equalizers = st.multiselect(
+        "Equalizers to Simulate",
+        list(EQUALIZERS),
+        default=DEFAULT_EQUALIZERS,
+        key=f"{prefix}equalizers",
+        help=(
+            "Every selected equalizer processes the same frames, so their "
+            "BERs can be compared directly. Linear/DFE equalizers are "
+            "time-domain FIR filters designed for each channel "
+            "realization; ZF ignores the noise, MMSE balances ISI and "
+            "noise. A DFE also cancels the ISI from its past decisions."
+        ),
+    )
+    if not equalizers:
+        st.error("Select at least one equalizer.")
+        return
+
+    states = M ** (L - 1)
+    trellis_ok = VITERBI not in equalizers or (
+        states <= MAX_TRELLIS_STATES and M ** L <= MAX_TRELLIS_BRANCHES
+    )
+    if VITERBI not in equalizers:
+        pass
+    elif trellis_ok:
+        st.caption(
+            f"Viterbi trellis: {states:,} states with {M} branches each."
+        )
+    else:
+        st.error(
+            f"The Viterbi trellis would have M^(L-1) = {states:,} states; "
+            f"the receiver allows at most {MAX_TRELLIS_STATES:,}. "
+            "Lower M or the number of taps, or deselect Viterbi."
+        )
+
+    st.divider()
+
+    # ---------------- noise / realizations ----------------
+    if sweep:
+        st.subheader("SNR Sweep Range (Es/N0)")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            snr_min = st.number_input(
+                "SNR Min (dB)", value=0.0, step=1.0, key=f"{prefix}snr_min",
+            )
+        with col2:
+            snr_max = st.number_input(
+                "SNR Max (dB)", value=20.0, step=1.0, key=f"{prefix}snr_max",
+            )
+        with col3:
+            snr_points = st.number_input(
+                "Number of Points", min_value=2, value=11, step=1,
+                key=f"{prefix}snr_points",
+            )
+
+        if snr_max <= snr_min:
+            st.error("SNR Max must be greater than SNR Min.")
+            return
+
+        if tap_model == "Fixed taps":
+            num_repetitions = 1
+        else:
+            num_repetitions = st.number_input(
+                "Channel Realizations per SNR Point",
+                min_value=1,
+                value=100,
+                step=10,
+                key=f"{prefix}sweep_repetitions",
+                help=(
+                    "Each SNR point averages over this many frames, each "
+                    "with its own channel taps."
+                ),
+            )
+        st.caption(
+            "For each sweep point N0 is computed as A / 10^(SNR_dB / 10) "
+            "so that SNR = Es/N0 with Es = A."
+        )
+    else:
+        N0 = st.number_input(
+            "Noise Power Spectral Density (N0)",
+            min_value=0.0,
+            value=0.1,
+            step=0.01,
+            format="%.6f",
+            key=f"{prefix}N0",
+        )
+        if tap_model == "Fixed taps":
+            num_repetitions = 1
+        else:
+            num_repetitions = st.number_input(
+                "Number of Channel Realizations to Average Over",
+                min_value=1,
+                value=100,
+                step=10,
+                key=f"{prefix}repetitions",
+            )
+
+    if tap_model == "Fixed taps":
+        st.caption(
+            "Fixed taps: the channel never changes, so no averaging over "
+            "channel realizations is needed. The BER comes from one frame "
+            "of the message length above; use a longer message for a "
+            "more accurate BER."
+        )
+
+    st.info(
+        "The receiver is given the exact taps of every channel "
+        "realization (perfect CSI), and each equalizer is redesigned "
+        "for them."
+    )
+
+    if st.button("Start Multi-Tap Simulation"):
+        k = int(np.log2(M))
+
+        if N % k:
+            st.error(
+                f"Message length must be divisible by {k} for M={M}."
+            )
+            return
+
+        if not trellis_ok:
+            st.error("Reduce M or the number of taps, or deselect Viterbi.")
+            return
+
+        st.session_state[f"{prefix}constellation_type"] = constellation
+        st.session_state[f"{prefix}M_value"] = M
+        st.session_state[f"{prefix}A_value"] = A
+        st.session_state[f"{prefix}N_value"] = int(N)
+        st.session_state[f"{prefix}repetitions_value"] = int(num_repetitions)
+        st.session_state[f"{prefix}tap_model_value"] = tap_model
+        st.session_state[f"{prefix}L_value"] = L
+        st.session_state[f"{prefix}pdp_value"] = pdp
+        st.session_state[f"{prefix}decay_db_value"] = float(decay_db)
+        st.session_state[f"{prefix}fixed_taps_value"] = (
+            None if fixed_taps is None else [complex(t) for t in fixed_taps]
+        )
+        # Keep the order of EQUALIZERS so curves and columns are stable.
+        st.session_state[f"{prefix}equalizers_value"] = [
+            eq for eq in EQUALIZERS if eq in equalizers
+        ]
+
+        if sweep:
+            st.session_state["sweep_snr_min"] = float(snr_min)
+            st.session_state["sweep_snr_max"] = float(snr_max)
+            st.session_state["sweep_num_points"] = int(snr_points)
+        else:
+            st.session_state[f"{prefix}N0_value"] = float(N0)
+
+        st.session_state[f"{prefix}configured"] = True
+
+        clear_session_keys(result_keys(prefix))
+        clear_session_keys([
+            f"{prefix}transmitters",
+            f"{prefix}receivers",
+            f"{prefix}c",
+        ])
+
+        st.rerun()
+
+
 # ============================================================
 # RUN CONFIGURED CHANNEL
 # ============================================================
 
 def render_configured_simulation(channel):
-    prefix = "" if channel == "AWGN" else f"{channel.lower()}_"
+    prefix = channel_prefix(channel)
     sweep = st.session_state.get("sweep_mode", False)
 
     initialize_modems(channel)
@@ -1336,6 +1983,10 @@ def render_configured_simulation(channel):
                     label_list = [
                         f"{row_label} {i+1}" for i in range(num_results)
                     ]
+                    if channel == MULTITAP:
+                        label_list = list(
+                            st.session_state.multitap_equalizers_value
+                        )
 
                     st.session_state[f"{prefix}sweep_results"] = {
                         "snr_db": snr_db_list,
@@ -1369,9 +2020,9 @@ def render_configured_simulation(channel):
                 else:
                     store_results(prefix, result)
 
-                    if channel == "AWGN":
+                    if channel == "AWGN" or is_fixed_multitap(channel):
                         st.success(
-                            f"AWGN {st.session_state.mimo_mode} completed!"
+                            f"{channel} {st.session_state.mimo_mode} completed!"
                         )
                     else:
                         st.success(
@@ -1422,7 +2073,14 @@ elif st.session_state.get("channel") == "Rayleigh":
     else:
         render_configured_simulation("Rayleigh")
 
-elif st.session_state.get("channel") in ("OFDM", "Multi-Tap Channel"):
+elif st.session_state.get("channel") == MULTITAP:
+
+    if not st.session_state.get("multitap_configured", False):
+        multitap_popup()
+    else:
+        render_configured_simulation(MULTITAP)
+
+elif st.session_state.get("channel") == "OFDM":
 
     st.warning(
         f"{st.session_state.channel} has not been implemented yet."
