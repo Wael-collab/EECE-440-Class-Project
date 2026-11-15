@@ -1,6 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
+@author: razanalkakoun
 MIMORicianFlatChannel.py
 
 SISO/MIMO flat, block-constant Rician fading channel.
