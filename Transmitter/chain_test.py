@@ -1,7 +1,15 @@
+import os
+import sys
+
 import numpy as np
 
-from Transmitter import Constellation, Transmitter
-from Coding_Schemes import Repetition, Alamouti, VBLAST
+# Runnable both from the project root (python Transmitter/chain_test.py) and
+# from inside Transmitter/ (python chain_test.py): always import through the
+# project-root package path, like every other module does.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from Transmitter.Transmitter import Constellation, Transmitter
+from Transmitter.Coding_Schemes import Repetition, Alamouti, VBLAST
 
 rng = np.random.default_rng(7)
 N = 4000

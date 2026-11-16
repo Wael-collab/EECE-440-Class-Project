@@ -9,7 +9,8 @@ channel functions.
 import numpy as np
 
 from Channel.AWGNChannel import AWGN_Channel
-from Channel.LTapChannel import LTapChannel
+# LTapChannel lives in Channel/OFDMChannel.py (there is no Channel/LTapChannel.py).
+from Channel.OFDMChannel import LTapChannel
 from Channel.OFDMChannel import OFDM as LegacyOFDMChannel
 from Channel.Rayleigh import Rayleigh_Channel
 from Channel.RicianChannel import Rician_Channel

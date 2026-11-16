@@ -204,6 +204,9 @@ class Receiver:
             Combined symbol estimates of shape (T,).
         """
         Y, H = self._simo_inputs(Y, H)
+        # A constant H (Nr, 1) must be expanded to one gain per symbol before the
+        # per-column indexing below (it previously raised an IndexError).
+        H = np.broadcast_to(H, Y.shape)
 
         best_branch = np.argmax(np.abs(H) ** 2, axis=0)
 
@@ -325,10 +328,12 @@ class Receiver:
         z1 = np.sum(np.conj(h1) * y1 + h2 * np.conj(y2), axis=0)
         z2 = np.sum(np.conj(h2) * y1 - h1 * np.conj(y2), axis=0)
         g = np.sum(np.abs(H) ** 2)
-        if N0 is not None:
-            if N0 < 0:
-                raise ValueError("N0 must be non-negative.")
-            g = g + N0 / self.constellation.A
+        # Always return the UNBIASED estimate z / g. The previous version divided by
+        # g + N0/Es when N0 was given (an MMSE scaling); that shrinks the amplitudes and
+        # degrades multi-level QAM with the minimum-distance slicer (see progress report,
+        # Sec. 3.5). N0 is still accepted and validated for API compatibility.
+        if N0 is not None and N0 < 0:
+            raise ValueError("N0 must be non-negative.")
 
         u = np.empty(Y.shape[1], dtype=complex)
         u[0::2], u[1::2] = z1 / g, z2 / g
@@ -356,6 +361,107 @@ class Receiver:
         """Alamouti-combine, slice and return the bit stream."""
         u = self.alamouti_combine(Y, H, N0, power_split)
         return self.bit_table[self._slice(u)].ravel()
+
+    # ---------- Alamouti over OFDM (Coding_Schemes.alamouti_ofdm_map) ----------
+    def alamouti_ofdm_combine(self, Y, H, power_split=True, freq_domain=False):
+        """
+        Alamouti combining for the OFDM mapping of Coding_Schemes.SpaceTimeTransmitter:
+        the pair m sits on subcarrier m % n of OFDM blocks 2(m // n) and 2(m // n) + 1,
+        so on every subcarrier k the ordinary Alamouti combiner is run with that
+        subcarrier's 2-antenna channel H[k] (constant over the two blocks).
+
+        Y : (Nr, samples) received samples, whole OFDM blocks (CP included) per antenna.
+        H : flat channel (Nr, 2); time-domain taps (Nr, 2, L) with L - 1 <= cyclic_prefix;
+            or, with freq_domain=True, per-subcarrier responses (Nr, 2, n_subcarriers).
+        Returns the unbiased symbol estimates (T,) in the original symbol order.
+        """
+        from Transmitter.Coding_Schemes import alamouti_ofdm_unmap
+
+        wf = self.waveform
+        if wf.name != "OFDM":
+            raise ValueError("alamouti_ofdm_combine needs the OFDM waveform.")
+        n = wf.n_subcarriers
+        H = np.asarray(H, dtype=complex)
+        if H.ndim == 2:
+            Hf = np.repeat(H[:, :, None], n, axis=2)
+        elif H.ndim == 3 and freq_domain:
+            if H.shape[2] != n:
+                raise ValueError("With freq_domain=True, H must be (Nr, 2, n_subcarriers).")
+            Hf = H
+        elif H.ndim == 3:
+            if H.shape[2] - 1 > wf.cyclic_prefix:
+                raise ValueError("The channel memory L-1 exceeds the cyclic prefix.")
+            Hf = np.fft.fft(H, n, axis=2)
+        else:
+            raise ValueError("H must have shape (Nr, 2), (Nr, 2, L) or (Nr, 2, n).")
+        if Hf.shape[1] != 2:
+            raise ValueError("Alamouti needs Nt = 2 transmit antennas.")
+        Y = np.atleast_2d(np.asarray(Y, dtype=complex))
+        if Y.shape[0] != Hf.shape[0]:
+            raise ValueError("Y must have shape (Nr, samples) with Nr = H.shape[0].")
+        Yd = np.vstack([wf.demodulate(row) for row in Y])          # CP removed + FFT
+        T = Yd.shape[1]
+        if (T // n) % 2 != 0:
+            raise ValueError("Alamouti over OFDM needs an even number of OFDM blocks.")
+        plain = Receiver(self.constellation)                       # no demodulation
+        u = np.empty(T, dtype=complex)
+        for k in range(n):
+            u[k::n] = plain.alamouti_combine(Yd[:, k::n], Hf[:, :, k], None, power_split)
+        return alamouti_ofdm_unmap(u, n)
+
+    def decode_alamouti_ofdm(self, Y, H, power_split=True, freq_domain=False):
+        """alamouti_ofdm_combine, slice and return the bit stream."""
+        u = self.alamouti_ofdm_combine(Y, H, power_split, freq_domain)
+        return self.bit_table[self._slice(u)].ravel()
+
+    # ---------- Repetition combining (Coding_Schemes.Repetition) ----------
+    def repetition_combine(self, Y, H, L, method="mrc"):
+        """
+        Combine the L copies sent by Coding_Schemes.Repetition(L) together with the Nr
+        receive branches: the Nr*L observations of each symbol are treated as diversity
+        branches and combined with MRC, EGC or selection combining.
+
+        Y : (Nr, samples) (or 1-D) received samples; each row is waveform-demodulated
+            first, giving T = L * Ns symbol-domain observations ordered s1 x L, s2 x L, ...
+        H : (Nr,) gains constant over the frame (block fading), or (Nr, T) gains per
+            symbol-domain observation (per-symbol fading; per-subcarrier gains for OFDM).
+            A 1-D H of length T with a 1-D Y is a SISO per-symbol gain sequence.
+        L : repetition factor. method : "mrc", "egc" or "selection".
+        Returns the combined estimates (Ns,).
+        """
+        L = int(L)
+        if L <= 0:
+            raise ValueError("L must be a positive integer.")
+        siso_seq = np.ndim(Y) == 1
+        Y = np.atleast_2d(np.asarray(Y, dtype=complex))
+        Yd = np.vstack([self.waveform.demodulate(row) for row in Y])
+        Nr, T = Yd.shape
+        if T % L:
+            raise ValueError(f"The number of observations ({T}) is not a multiple of L = {L}.")
+        H = np.asarray(H, dtype=complex)
+        if H.ndim == 0:
+            H = np.full((Nr, 1), H)
+        elif H.ndim == 1:
+            H = H[None, :] if (siso_seq and H.size == T and Nr == 1) else H[:, None]
+        if H.ndim != 2 or H.shape[0] != Nr or H.shape[1] not in (1, T):
+            raise ValueError("H must have shape (Nr,), (Nr, 1) or (Nr, T).")
+        H = np.broadcast_to(H, (Nr, T))
+        Ns = T // L
+        Yb = Yd.reshape(Nr, Ns, L).transpose(0, 2, 1).reshape(Nr * L, Ns)
+        Hb = H.reshape(Nr, Ns, L).transpose(0, 2, 1).reshape(Nr * L, Ns)
+        plain = Receiver(self.constellation)                       # branches already demodulated
+        method = str(method).lower()
+        if method == "mrc":
+            return plain.mrc_combine(Yb, Hb)
+        if method == "egc":
+            return plain.egc_combine(Yb, Hb)
+        if method == "selection":
+            return plain.selection_combine(Yb, Hb)
+        raise ValueError("method must be 'mrc', 'egc' or 'selection'.")
+
+    def decode_repetition(self, Y, H, L, method="mrc"):
+        """repetition_combine, slice and return the bit stream."""
+        return self.bit_table[self._slice(self.repetition_combine(Y, H, L, method))].ravel()
 
     # ---------- pilot-based channel estimation ----------
     def pilots(self, n_tx, n_pilots=None, power_split=True):

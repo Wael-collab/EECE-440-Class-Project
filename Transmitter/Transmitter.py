@@ -208,6 +208,16 @@ class Transmitter:
         self.M = constellation.M
     
     def run(self, bits, N):
+        """bits -> constellation symbols -> waveform samples (unchanged behavior)."""
+        return self.waveform.modulate(self.symbols(bits, N))
+
+    def symbols(self, bits, N):
+        """
+        Same checks as run(), but stops BEFORE the waveform and returns the 1-D
+        constellation-symbol stream. This is the input a CodingScheme expects:
+        space-time coding must act on symbols, and the waveform (SC / OFDM) is
+        then applied per antenna (see Coding_Schemes.SpaceTimeTransmitter).
+        """
         if not isinstance(N, (int, np.integer)) or N <= 0:
             raise ValueError("N must be a positive integer.")
         if N % self.k != 0:
@@ -224,8 +234,14 @@ class Transmitter:
         if len(bits) != N:
             raise ValueError(f"Expected {N} bits, got {len(bits)}.")
 
-        return self.modulate(bits)
+        return self.map_bits(bits)
+
     def modulate(self, bits):
+        """bits -> symbols -> waveform samples (unchanged behavior)."""
+        return self.waveform.modulate(self.map_bits(bits))
+
+    def map_bits(self, bits):
+        """Gray-label lookup only: k-bit labels (MSB first) -> constellation symbols."""
         bits = np.asarray(bits, dtype=int).ravel()
 
         if not np.all((bits == 0) | (bits == 1)):
@@ -237,9 +253,7 @@ class Transmitter:
         # Each row is one k-bit label (MSB first); convert rows to table indices
         weights = 1 << np.arange(self.k - 1, -1, -1)
         idx = bits.reshape(-1, self.k) @ weights
-        symbols = self.constellation.table[idx]
-
-        return self.waveform.modulate(symbols)
+        return self.constellation.table[idx]
 
 if __name__ == "__main__":
     N = 64

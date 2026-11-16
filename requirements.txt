@@ -1,0 +1,4 @@
+numpy
+matplotlib
+streamlit>=1.37      # st.dialog, st.page_link and the pages/ multipage layout
+aub_htp              # optional: alpha-stable impulsive noise (Channel/AWSN.py)
