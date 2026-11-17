@@ -18,7 +18,7 @@ from Receiver.receiver import Receiver
 from Transmitter.Transmitter import Constellation, Transmitter, Waveform
 
 try:
-    from Channel.AWSN import Alpha_Stable_Channel
+    from Channel.AIndependentSN import Alpha_Stable_Channel
 except ModuleNotFoundError as exc:
     if exc.name != "aub_htp":
         raise
