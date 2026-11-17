@@ -1,5 +1,5 @@
 """
-General Link Simulator (Streamlit page of controllertestv1.py).
+General Link Simulator (Streamlit).
 
 Every implemented block is selectable and connected end to end through
 Integration/link_engine.py:
@@ -11,41 +11,71 @@ Integration/link_engine.py:
        legacy OFDM link) + noise (Gaussian or alpha-stable)
     -> every receiver detector that applies to that combination.
 
-Run the app from the project root:  streamlit run controllertestv1.py
+Layout
+------
+* Sidebar: the link configuration (transmitter, channel, receiver).
+* Main area: simulation settings and the results, organised in tabs.
+
+Simulation kinds
+----------------
+* Single point     one noise level.
+* SNR sweep        BER / SER versus Es/N0 or Eb/N0.
+* Parameter sweep  BER / SER / goodput versus one link parameter (Nr, Nt, M, L, cyclic
+                   prefix, subcarriers, Rician K, repetition factor or alpha) at a fixed SNR.
+                   Every value is simulated with the same seed and frame count; values that
+                   the modules do not support are skipped and reported with the reason.
+
+Run
+---
+From the project root (the folder that contains Integration/, Transmitter/, ...):
+
+    streamlit run General_Link_Simulator.py
+
+The file also works as a page of a multipage app placed in a pages/ folder.
 """
 
+import csv
+import dataclasses
 import hashlib
 import io
+import math
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Make the project packages importable whether this file sits in the project root or in a
+# pages/ sub-folder of it.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _cand in (_HERE, os.path.dirname(_HERE)):
+    if os.path.isdir(os.path.join(_cand, "Integration")):
+        if _cand not in sys.path:
+            sys.path.insert(0, _cand)
+        break
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import NullLocator
 import numpy as np
 import streamlit as st
 
 from Integration import link_engine as le
 
 st.set_page_config(page_title="General Link Simulator", page_icon="📡", layout="wide")
-st.title("📡 General Link Simulator")
-
-try:  # only resolvable when the page runs inside the multipage app
-    st.page_link("controllertestv1.py", label="Back to the classic simulator", icon="⬅️")
-except Exception:
-    pass
 
 BER_FLOOR = 1e-8
 ORDERS = {"PAM": [2, 4, 8, 16, 32, 64, 128, 256], "PSK": [2, 4, 8, 16, 32, 64, 128, 256],
           "ASK": [2, 4, 8, 16], "QAM": [4, 16, 64, 256, 1024]}
 FSK_ORDERS = [2, 4, 8, 16, 32, 64]
 DEFAULT_CUSTOM = "00: 1+1j, 01: -1+1j, 11: -1-1j, 10: 1-1j"
+MAX_SWEEP_VALUES = 25
+SIM_KINDS = ["Single point", "SNR sweep", "Parameter sweep"]
 
 
+# ============================================================
+# Helpers
+# ============================================================
 def skey(name, options=()):
     """Widget key that changes when the option list changes (avoids stale selections)."""
     sig = hashlib.md5("|".join(map(str, options)).encode()).hexdigest()[:8]
@@ -57,13 +87,180 @@ def pick(label, options, table, name, index=0, help=None):
                         format_func=lambda k: table[k], key=skey(name, options), help=help)
 
 
+def clamp(x):
+    """Value for a log axis: NaN stays NaN (gap), zero errors are drawn at BER_FLOOR."""
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return float("nan")
+    return max(float(x), BER_FLOOR)
+
+
+def to_csv(data):
+    """dict of equal-length columns -> CSV text (labels are quoted where needed)."""
+    keys = list(data)
+    n = len(data[keys[0]]) if keys else 0
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(keys)
+    for i in range(n):
+        writer.writerow(["" if data[k][i] is None else data[k][i] for k in keys])
+    return buf.getvalue()
+
+
+def config_summary(cfg):
+    if cfg.scheme == "FSK":
+        mod = f"{cfg.M}-FSK"
+    elif cfg.constellation == "CUSTOM":
+        mod = f"custom mapping (M = {cfg.M})"
+    else:
+        mod = f"{cfg.M}-{cfg.constellation}"
+    parts = [le.SCHEMES[cfg.scheme].split(" (")[0], mod, le.WAVEFORMS[cfg.waveform],
+             le.CHANNELS[cfg.channel].split(" (")[0],
+             f"Nt = {le.n_tx_of(cfg)}, Nr = {cfg.n_rx}", le.NOISES[cfg.noise].split(" (")[0]]
+    return " · ".join(parts)
+
+
 # ============================================================
-# CONFIGURATION
+# Parameter sweep: which parameters, which values
 # ============================================================
-col_tx, col_ch, col_rx = st.columns(3)
+# key -> (label, type, default values text). M is handled with a multiselect.
+SWEEP_PARAMS = {
+    "n_rx": ("Receive antennas Nr", int, "1, 2, 3, 4"),
+    "n_tx": ("Transmit antennas Nt (V-BLAST)", int, "2, 3, 4"),
+    "M": ("Modulation order M", int, None),
+    "L_taps": ("Number of channel taps L", int, "1, 2, 3, 4, 6, 8"),
+    "cyclic_prefix": ("Cyclic prefix N_CP", int, None),
+    "n_subcarriers": ("Subcarriers / block size N", int, "16, 32, 64, 128"),
+    "K": ("Rician K-factor (linear)", float, "0, 0.5, 1, 3, 10, 30"),
+    "rep_L": ("Repetition factor L", int, "1, 2, 3, 4"),
+    "alpha": ("Alpha-stable exponent alpha", float, "1.2, 1.4, 1.6, 1.8, 2.0"),
+}
+
+
+def sweepable_params(cfg):
+    """Parameters that exist for the current configuration."""
+    out = ["n_rx"]
+    if cfg.scheme == "VBLAST":
+        out.append("n_tx")
+    if cfg.constellation != "CUSTOM" or cfg.scheme == "FSK":
+        out.append("M")
+    if cfg.channel in ("MULTIPATH", "LEGACY_OFDM"):
+        out.append("L_taps")
+    if cfg.waveform in ("SC_CP", "OFDM"):
+        out += ["cyclic_prefix", "n_subcarriers"]
+    if cfg.channel in ("RICIAN_FAST", "RICIAN_BLOCK"):
+        out.append("K")
+    if cfg.scheme == "REPETITION":
+        out.append("rep_L")
+    if cfg.noise == "ALPHA_STABLE":
+        out.append("alpha")
+    return out
+
+
+def m_options(cfg):
+    if cfg.scheme == "FSK":
+        return FSK_ORDERS
+    if cfg.scheme in ("DPSK", "DIFF_ALAMOUTI"):
+        return ORDERS["PSK"]
+    return ORDERS.get(cfg.constellation, [])
+
+
+def parse_values(text, typ):
+    """Comma-separated numbers -> sorted list without duplicates (raises ValueError)."""
+    vals = []
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = float(part)
+        except ValueError:
+            raise ValueError(f"'{part}' is not a number.") from None
+        if not math.isfinite(v):
+            raise ValueError(f"'{part}' is not a finite number.")
+        if typ is int:
+            if v != int(v):
+                raise ValueError(f"'{part}' must be an integer.")
+            v = int(v)
+        vals.append(v)
+    vals = sorted(set(vals))
+    if not vals:
+        raise ValueError("Enter at least one value.")
+    if len(vals) > MAX_SWEEP_VALUES:
+        raise ValueError(f"Enter at most {MAX_SWEEP_VALUES} values.")
+    return vals
+
+
+def check_values(param, vals, cfg):
+    """Basic range checks; combination checks are left to link_engine.validate."""
+    lo = {"n_rx": 1, "n_tx": 2, "L_taps": 1, "cyclic_prefix": 0, "n_subcarriers": 2,
+          "K": 0.0, "rep_L": 1}
+    hi = {"n_rx": 8, "n_tx": 8, "L_taps": 16, "rep_L": 16}
+    for v in vals:
+        if param in lo and v < lo[param]:
+            raise ValueError(f"{SWEEP_PARAMS[param][0]} must be at least {lo[param]}.")
+        if param in hi and v > hi[param]:
+            raise ValueError(f"{SWEEP_PARAMS[param][0]} must be at most {hi[param]}.")
+        if param == "alpha" and not 0 < v <= 2:
+            raise ValueError("alpha must be in (0, 2].")
+        if param == "cyclic_prefix" and v >= int(cfg.n_subcarriers):
+            raise ValueError(f"The cyclic prefix must be smaller than N = {cfg.n_subcarriers}.")
+        if param == "n_subcarriers" and v <= int(cfg.cyclic_prefix):
+            raise ValueError(f"N must be larger than the cyclic prefix ({cfg.cyclic_prefix}).")
+
+
+def run_parameter_sweep(cfg, param, values, n_bits, n_frames, definition, snr_db, seed,
+                        progress=None):
+    """
+    Simulate the link once per parameter value (same seed, same number of frames).
+    The frame length is rounded to the nearest valid multiple for every value, and
+    detectors that do not apply to a value are left out for that value only.
+    """
+    dets = list(cfg.detectors)
+    rows = []
+    for i, v in enumerate(values):
+        row = {"value": v, "ok": False}
+        try:
+            cv = dataclasses.replace(cfg, **{param: v})
+            cv.detectors = []                                   # own list, never shared
+            c = le.make_constellation(cv)
+            allowed = le.detectors_for(cv, c)
+            use = [d for d in dets if d in allowed]
+            if not use:
+                raise ValueError("none of the selected detectors applies to this value")
+            cv.detectors = use
+            le.validate(cv)
+            mult = le.bit_multiple(cv)
+            nb = max(mult, int(round(n_bits / mult)) * mult)
+            N0 = le.n0_from_snr(cv, snr_db, nb, definition)
+            link = le.Link(cv)
+            r = link.simulate(nb, N0, n_frames, seed=seed)
+            theory = link.theory_ser([N0])
+            row.update(ok=True, bits=nb, N0=r["N0"], gamma=r["gamma"], rate=r["rate"],
+                       EsN0_dB=r["EsN0_dB"], EbN0_dB=r["EbN0_dB"],
+                       per_detector=r["per_detector"],
+                       missing=[d for d in dets if d not in use],
+                       theory_ser=None if theory is None else theory[0])
+        except Exception as exc:                              # report, keep sweeping
+            row["reason"] = f"{type(exc).__name__}: {exc}"
+        rows.append(row)
+        if progress is not None:
+            progress((i + 1) / len(values), v)
+    return rows
+
+
+# ============================================================
+# SIDEBAR: link configuration
+# ============================================================
 cfg = le.LinkConfig()
 
-with col_tx:
+with st.sidebar:
+    st.header("Link configuration")
+    try:  # only resolvable when this file runs as a page of the multipage app
+        st.page_link("controllertestv1.py", label="Back to the classic simulator", icon="⬅️")
+    except Exception:
+        pass
+
+    # ---------------- 1 · Transmitter ----------------
     st.subheader("1 · Transmitter")
     cfg.scheme = pick("Coding / transmission scheme", list(le.SCHEMES), le.SCHEMES, "scheme",
                       help="Coding_Schemes.py: Repetition, Alamouti, V-BLAST, DifferentialPSK, "
@@ -120,18 +317,23 @@ with col_tx:
         c1, c2 = st.columns(2)
         with c1:
             cfg.n_subcarriers = int(st.number_input(
-                "Subcarriers / block size N", min_value=2, value=64, step=1, key=skey("nsc")))
+                "Subcarriers N", min_value=2, value=64, step=1, key=skey("nsc"),
+                help="OFDM size, or block size for SC with a cyclic prefix."))
         with c2:
             cfg.cyclic_prefix = int(st.number_input(
                 "Cyclic prefix N_CP", min_value=0, max_value=max(0, cfg.n_subcarriers - 1),
                 value=min(16, cfg.n_subcarriers - 1), step=1, key=skey("cp")))
 
-with col_ch:
+    # ---------------- 2 · Channel ----------------
+    st.divider()
     st.subheader("2 · Channel")
     ch_opts = le.channels_for(cfg.scheme, cfg.waveform)
     cfg.channel = pick("Channel model", ch_opts, le.CHANNELS, "ch")
+    # The key depends on Nt, so Nr starts at Nt again whenever Nt changes (e.g. when
+    # switching to V-BLAST or Alamouti); otherwise an old Nr = 1 would silently hide ZF.
     cfg.n_rx = int(st.number_input("Receive antennas Nr", min_value=1, max_value=8,
-                                   value=max(1, le.n_tx_of(cfg)), step=1, key=skey("nr")))
+                                   value=max(1, le.n_tx_of(cfg)), step=1,
+                                   key=skey("nr", (le.n_tx_of(cfg),))))
     if cfg.channel in ("RICIAN_FAST", "RICIAN_BLOCK"):
         cfg.K = st.number_input("Rician K-factor (linear)", min_value=0.0, value=1.0, step=0.5,
                                 key=skey("K"))
@@ -154,7 +356,8 @@ with col_ch:
         cfg.alpha = st.slider("Characteristic exponent alpha", min_value=0.5, max_value=2.0,
                               value=1.8, step=0.05, key=skey("alpha"))
 
-with col_rx:
+    # ---------------- 3 · Receiver ----------------
+    st.divider()
     st.subheader("3 · Receiver")
     try:
         det_opts = le.detectors_for(cfg)
@@ -184,25 +387,31 @@ with col_rx:
     st.caption("Coherent detectors are given the exact channel realization (perfect CSI); "
                "differential, FSK and energy detectors use no channel knowledge.")
 
+
+# ============================================================
+# MAIN AREA: header and validation
+# ============================================================
+st.title("📡 General Link Simulator")
+st.caption(config_summary(cfg))
+
 try:
     le.validate(cfg)
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
 
-with st.expander("Signal chain (which module function every block calls)", expanded=False):
-    st.table({"Block": [b for b, _ in le.chain_description(cfg)],
-              "Call": [c for _, c in le.chain_description(cfg)]})
+with st.expander("Signal chain of the current configuration (module function per block)"):
+    chain_now = le.chain_description(cfg)
+    st.table({"Block": [b for b, _ in chain_now], "Call": [c for _, c in chain_now]})
 
 # ============================================================
 # SIMULATION SETTINGS
 # ============================================================
-st.subheader("4 · Simulation")
+st.subheader("Simulation")
 mult = le.bit_multiple(cfg)
 s1, s2, s3, s4 = st.columns(4)
 with s1:
-    kind = st.radio("Simulation kind", ["Single point", "BER sweep"], horizontal=True,
-                    key=skey("kind"))
+    kind = st.radio("Simulation kind", SIM_KINDS, key=skey("kind"))
 with s2:
     default_bits = mult * max(1, int(round(1024 / mult)))
     n_bits = int(st.number_input(f"Bits per frame (multiple of {mult})", min_value=mult,
@@ -221,6 +430,12 @@ if n_bits % mult:
     st.error(f"The frame length must be a multiple of {mult} bits for this configuration.")
     st.stop()
 
+N0 = gamma = None
+definition = "EsN0"
+snr_db = None
+sweep_param = None
+sweep_values = None
+
 if kind == "Single point":
     if cfg.noise == "GAUSSIAN":
         n1, n2 = st.columns(2)
@@ -232,17 +447,17 @@ if kind == "Single point":
                 N0 = st.number_input("N0", min_value=0.0, value=0.1, step=0.01, format="%.6f",
                                      key=skey("N0"))
             else:
-                snr_db = st.number_input(spec, value=10.0, step=1.0, key=skey("snr", (spec,)))
-                N0 = le.n0_from_snr(cfg, snr_db, n_bits,
+                snr_in = st.number_input(spec, value=10.0, step=1.0, key=skey("snr", (spec,)))
+                N0 = le.n0_from_snr(cfg, snr_in, n_bits,
                                     "EsN0" if spec.startswith("Es") else "EbN0")
-        gamma = None
     else:
         gamma = st.number_input("Noise scale gamma", min_value=0.0, value=0.1, step=0.01,
                                 format="%.4f", key=skey("gamma"))
         N0 = 4 * gamma ** 2
         st.caption("For alpha < 2 the noise variance is infinite; detectors that need a "
                    "noise level use the alpha = 2 equivalent N0 = 4·gamma².")
-else:
+
+elif kind == "SNR sweep":
     w1, w2, w3, w4 = st.columns(4)
     with w1:
         definition = pick("SNR definition", list(le.SNR_DEFINITIONS), le.SNR_DEFINITIONS, "def")
@@ -251,7 +466,8 @@ else:
     with w3:
         snr_max = st.number_input("SNR max [dB]", value=20.0, step=1.0, key=skey("smax"))
     with w4:
-        n_pts = int(st.number_input("Points", min_value=2, value=11, step=1, key=skey("npts")))
+        n_pts = int(st.number_input("Points", min_value=2, max_value=101, value=11, step=1,
+                                    key=skey("npts")))
     if snr_max <= snr_min:
         st.error("SNR max must be greater than SNR min.")
         st.stop()
@@ -259,34 +475,98 @@ else:
         st.caption("alpha-stable sweep: the Gaussian-equivalent SNR is mapped to "
                    "gamma = sqrt(N0 / 4).")
 
+else:  # Parameter sweep
+    params = sweepable_params(cfg)
+    p1, p2 = st.columns([1, 2])
+    with p1:
+        sweep_param = st.selectbox("Parameter to sweep", params,
+                                   format_func=lambda k: SWEEP_PARAMS[k][0],
+                                   key=skey("sparam", params))
+    label, typ, default_text = SWEEP_PARAMS[sweep_param]
+    with p2:
+        try:
+            if sweep_param == "M":
+                opts = m_options(cfg)
+                default_m = [m for m in opts if m <= 64][:4] or opts[:1]
+                sweep_values = sorted(st.multiselect(
+                    "Values of M", opts, default=default_m, key=skey("svals_M", opts)))
+                if not sweep_values:
+                    raise ValueError("Select at least one value of M.")
+            else:
+                if sweep_param == "cyclic_prefix":
+                    n_sc = int(cfg.n_subcarriers)
+                    start = max(0, int(cfg.L_taps) - 1) if cfg.channel == "MULTIPATH" else 0
+                    cands = sorted({c for c in (start, start + 2, n_sc // 8, n_sc // 4,
+                                                n_sc // 2) if start <= c < n_sc})
+                    default_text = ", ".join(str(c) for c in cands)
+                text = st.text_input(f"Values of {label} (comma-separated)",
+                                     value=default_text,
+                                     key=skey("svals_" + sweep_param,
+                                              (default_text, cfg.n_subcarriers,
+                                               cfg.L_taps, cfg.channel)))
+                sweep_values = parse_values(text, typ)
+            check_values(sweep_param, sweep_values, cfg)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+    q1, q2 = st.columns([1, 2])
+    with q1:
+        definition = pick("SNR definition", list(le.SNR_DEFINITIONS), le.SNR_DEFINITIONS,
+                          "pdef")
+    with q2:
+        snr_db = st.number_input("Fixed SNR [dB]", value=10.0, step=1.0, key=skey("psnr"))
+    notes = ["Every value is simulated with the same seed and number of frames.",
+             "The frame length is rounded to the nearest valid multiple for every value.",
+             "Detectors that do not apply to a value are left out for that value only."]
+    if sweep_param == "cyclic_prefix" and cfg.channel == "MULTIPATH":
+        notes.append(f"The modules require N_CP ≥ L − 1 = {int(cfg.L_taps) - 1} on the "
+                     "multipath channel; smaller values are reported as skipped.")
+    if sweep_param in ("cyclic_prefix", "n_subcarriers", "rep_L") and definition == "EsN0":
+        notes.append("With Es/N0 the cyclic-prefix and repetition energy is not charged to the "
+                     "bits; choose Eb/N0 to include that overhead.")
+    if cfg.noise == "ALPHA_STABLE":
+        notes.append("alpha-stable noise: the SNR is mapped to gamma = sqrt(N0 / 4).")
+    st.caption(" ".join(notes))
+
 # ============================================================
 # RUN
 # ============================================================
 if st.button("Run simulation", type="primary"):
     try:
-        link = le.Link(cfg)
         t0 = time.perf_counter()
-        if kind == "Single point":
-            result = link.simulate(n_bits, N0, n_frames, gamma=gamma, seed=seed)
-            payload = {"kind": "point", "result": result}
-        else:
+        base = {"cfg": dataclasses.replace(cfg, detectors=list(cfg.detectors)),
+                "n_bits": n_bits, "n_frames": n_frames, "seed": seed,
+                "chain": le.chain_description(cfg)}
+        if kind == "Parameter sweep":
             bar = st.progress(0.0)
-            snrs = list(np.linspace(snr_min, snr_max, n_pts))
-            result = link.sweep(n_bits, snrs, n_frames, definition, seed=seed,
-                                progress=lambda f, s: bar.progress(f, text=f"SNR = {s:.2f} dB"))
+            rows = run_parameter_sweep(
+                cfg, sweep_param, sweep_values, n_bits, n_frames, definition, snr_db, seed,
+                progress=lambda f, v: bar.progress(f, text=f"{SWEEP_PARAMS[sweep_param][0]}"
+                                                           f" = {v}"))
             bar.empty()
-            payload = {"kind": "sweep", "result": result, "definition": definition}
-        payload.update(elapsed=time.perf_counter() - t0, cfg=cfg, n_bits=n_bits,
-                       n_frames=n_frames, chain=le.chain_description(cfg),
-                       table=link.c.table.copy(), mapping=dict(link.c.mapping),
-                       theory=link.theory_available())
+            payload = dict(base, kind="param", rows=rows, param=sweep_param,
+                           definition=definition, snr_db=snr_db)
+        else:
+            link = le.Link(cfg)
+            if kind == "Single point":
+                result = link.simulate(n_bits, N0, n_frames, gamma=gamma, seed=seed)
+                payload = dict(base, kind="point", result=result)
+            else:
+                bar = st.progress(0.0)
+                snrs = list(np.linspace(snr_min, snr_max, n_pts))
+                result = link.sweep(n_bits, snrs, n_frames, definition, seed=seed,
+                                    progress=lambda f, s: bar.progress(f, text=f"SNR = {s:.2f} dB"))
+                bar.empty()
+                payload = dict(base, kind="sweep", result=result, definition=definition)
+            payload.update(table=link.c.table.copy(), mapping=dict(link.c.mapping))
+        payload["elapsed"] = time.perf_counter() - t0
         st.session_state["gl_payload"] = payload
     except Exception as exc:          # show every module error in the GUI
         st.error(f"Simulation failed: {type(exc).__name__}: {exc}")
 
 
 # ============================================================
-# RESULTS
+# RESULT VIEWS
 # ============================================================
 def bit_table(bits, decoded, names, n_show=48):
     n_show = min(n_show, len(bits))
@@ -308,7 +588,7 @@ def bit_table(bits, decoded, names, n_show=48):
 
 
 def constellation_plot(table, mapping):
-    fig, ax = plt.subplots(figsize=(3.6, 3.6))
+    fig, ax = plt.subplots(figsize=(4.2, 4.2))
     ax.scatter(table.real, table.imag, s=40, color="#1f77b4", zorder=3)
     if len(table) <= 64:
         for label, s in mapping.items():
@@ -337,20 +617,44 @@ def show_channel(H, channel):
     elif channel in le.FAST:
         st.write(f"Per-sample fading: mean |h|² over the last frame = "
                  f"{float(np.mean(np.abs(H) ** 2)):.3f} (expected 1).")
+    else:
+        st.write("No channel view is available for this channel model.")
 
 
-payload = st.session_state.get("gl_payload")
-if payload:
-    pcfg = payload["cfg"]
-    st.divider()
-    st.subheader("Results")
-    st.caption(f"{le.SCHEMES[pcfg.scheme]} · {le.WAVEFORMS[pcfg.waveform]} · "
-               f"{le.CHANNELS[pcfg.channel]} · Nt = {le.n_tx_of(pcfg)}, Nr = {pcfg.n_rx} · "
-               f"{payload['n_bits']} bits × {payload['n_frames']} frames · "
-               f"{payload['elapsed']:.2f} s")
-    r = payload["result"]
+def signal_chain_view(chain):
+    st.table({"Block": [b for b, _ in chain], "Call": [c for _, c in chain]})
 
-    if payload["kind"] == "point":
+
+def error_rate_plot(x, curves, xlabel, ylabel, title, theory=None, log2x=False, logy=True):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    plot = ax.semilogy if logy else ax.plot
+    for name, ys in curves.items():
+        plot(x, [clamp(y) for y in ys] if logy else ys, marker="o", label=name)
+    if theory is not None:
+        plot(x, [clamp(y) for y in theory], "k--", label="Theory (receiver.theory_ser_qam)")
+    if log2x:
+        ax.set_xscale("log", base=2)
+    if log2x or len(x) <= 12:                 # ticks only at the simulated values
+        ax.set_xticks(list(x))
+        ax.set_xticklabels([f"{v:g}" for v in x])
+        ax.xaxis.set_minor_locator(NullLocator())   # x only; keep the log-y minor grid
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    # Legend below the axes so that it never hides a curve (st.pyplot crops tightly).
+    ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2,
+              frameon=False)
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def results_point(payload):
+    r, pcfg = payload["result"], payload["cfg"]
+    names = list(r["per_detector"])
+    t_err, t_bits, t_ch, t_const, t_chain = st.tabs(
+        ["Error rates", "Bits", "Channel", "Constellation", "Signal chain"])
+    with t_err:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Es/N0", f"{r['EsN0_dB']:.2f} dB")
         m2.metric("Eb/N0", f"{r['EbN0_dB']:.2f} dB")
@@ -359,7 +663,6 @@ if payload:
                   f"{r['N0']:.4g}" if pcfg.noise == "GAUSSIAN" else f"{r['gamma']:.4g}")
         st.caption(f"Channel uses per frame and antenna (incl. CP / reference symbols): "
                    f"{r['channel_uses_per_frame']}. Goodput = rate × (1 − BER).")
-        names = list(r["per_detector"])
         st.dataframe({
             "Detector": [le.DETECTORS[d] for d in names],
             "BER": [v["ber"] for v in r["per_detector"].values()],
@@ -368,38 +671,38 @@ if payload:
             "Bits": [v["bits"] for v in r["per_detector"].values()],
             "Goodput [bits/use]": [v["goodput"] for v in r["per_detector"].values()],
         })
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.write("Transmitted and decoded bits (last frame, first 48 bits):")
-            last = r["last"]
-            bit_table(last["bits"], {le.DETECTORS[d]: last["decoded"][d] for d in names},
-                      [le.DETECTORS[d] for d in names])
-            show_channel(last["H"], pcfg.channel)
-        with c2:
-            if pcfg.scheme != "FSK":
-                constellation_plot(payload["table"], payload["mapping"])
-    else:
-        snr = r["snr_db"]
-        xlabel = "Es/N0 [dB]" if payload["definition"] == "EsN0" else "Eb/N0 [dB]"
+    with t_bits:
+        st.write("Transmitted and decoded bits (last frame, first 48 bits):")
+        last = r["last"]
+        bit_table(last["bits"], {le.DETECTORS[d]: last["decoded"][d] for d in names},
+                  [le.DETECTORS[d] for d in names])
+    with t_ch:
+        show_channel(r["last"]["H"], pcfg.channel)
+    with t_const:
+        if pcfg.scheme == "FSK":
+            st.write("FSK uses orthogonal tones; there is no signal-space constellation.")
+        else:
+            constellation_plot(payload["table"], payload["mapping"])
+    with t_chain:
+        signal_chain_view(payload["chain"])
+
+
+def results_snr_sweep(payload):
+    r, pcfg = payload["result"], payload["cfg"]
+    snr = r["snr_db"]
+    xlabel = "Es/N0 [dB]" if payload["definition"] == "EsN0" else "Eb/N0 [dB]"
+    t_err, t_data, t_const, t_chain = st.tabs(
+        ["Error rates", "Data", "Constellation", "Signal chain"])
+    with t_err:
         p1, p2 = st.columns(2)
         for col, metric, title in ((p1, "ber", "BER"), (p2, "ser", "SER")):
             with col:
-                fig, ax = plt.subplots(figsize=(6, 4))
-                for d, v in r["per_detector"].items():
-                    ax.semilogy(snr, [max(x, BER_FLOOR) for x in v[metric]], marker="o",
-                                label=le.DETECTORS[d])
-                if metric == "ser" and r.get("theory_ser"):
-                    ax.semilogy(snr, [max(x, BER_FLOOR) for x in r["theory_ser"]], "k--",
-                                label="Theory (receiver.theory_ser_qam)")
-                ax.set_xlabel(xlabel)
-                ax.set_ylabel(title)
-                ax.set_title(f"{title} vs SNR")
-                ax.grid(True, which="both", alpha=0.3)
-                ax.legend(fontsize=7)
-                st.pyplot(fig)
-                plt.close(fig)
-        st.caption(f"Values at or below {BER_FLOOR:.0e} are clamped for the log axis "
+                curves = {le.DETECTORS[d]: v[metric] for d, v in r["per_detector"].items()}
+                theory = r.get("theory_ser") if metric == "ser" else None
+                error_rate_plot(snr, curves, xlabel, title, f"{title} vs SNR", theory=theory)
+        st.caption(f"Values at or below {BER_FLOOR:.0e} are drawn at {BER_FLOOR:.0e} "
                    "(zero observed errors).")
+    with t_data:
         data = {xlabel: snr, "N0": r["N0"]}
         for d, v in r["per_detector"].items():
             data[f"BER {le.DETECTORS[d]}"] = v["ber"]
@@ -407,13 +710,111 @@ if payload:
         if r.get("theory_ser"):
             data["SER theory"] = r["theory_ser"]
         st.dataframe(data)
-        buf = io.StringIO()
-        keys = list(data)
-        buf.write(",".join(keys) + "\n")
-        for i in range(len(snr)):
-            buf.write(",".join(str(data[k][i]) for k in keys) + "\n")
-        st.download_button("Download sweep data (CSV)", buf.getvalue(), "sweep.csv", "text/csv")
+        st.download_button("Download sweep data (CSV)", to_csv(data), "snr_sweep.csv",
+                           "text/csv")
+    with t_const:
+        if pcfg.scheme == "FSK":
+            st.write("FSK uses orthogonal tones; there is no signal-space constellation.")
+        else:
+            constellation_plot(payload["table"], payload["mapping"])
+    with t_chain:
+        signal_chain_view(payload["chain"])
 
-    with st.expander("Signal chain used for these results"):
-        st.table({"Block": [b for b, _ in payload["chain"]],
-                  "Call": [c for _, c in payload["chain"]]})
+
+def results_param_sweep(payload):
+    rows, param, pcfg = payload["rows"], payload["param"], payload["cfg"]
+    label = SWEEP_PARAMS[param][0]
+    ok = [row for row in rows if row["ok"]]
+    skipped = [row for row in rows if not row["ok"]]
+    snr_name = "Es/N0" if payload["definition"] == "EsN0" else "Eb/N0"
+    dets = list(pcfg.detectors)
+
+    t_err, t_data, t_chain = st.tabs(["Error rates", "Data", "Signal chain"])
+    with t_err:
+        st.caption(f"{label} swept at {snr_name} = {payload['snr_db']:g} dB, "
+                   f"{payload['n_frames']} frames per value.")
+        if skipped:
+            st.warning("Skipped values: " + "; ".join(
+                f"{row['value']} ({row['reason']})" for row in skipped))
+        if not ok:
+            st.error("No value of the sweep could be simulated.")
+        else:
+            x = [row["value"] for row in ok]
+
+            def series(metric):
+                out = {}
+                for d in dets:
+                    ys = [row["per_detector"][d][metric] if d in row["per_detector"]
+                          else float("nan") for row in ok]
+                    if not all(isinstance(y, float) and math.isnan(y) for y in ys):
+                        out[le.DETECTORS[d]] = ys
+                return out
+
+            theory = [row["theory_ser"] for row in ok]
+            theory = None if any(t is None for t in theory) else theory
+            log2x = param == "M"
+            p1, p2 = st.columns(2)
+            with p1:
+                error_rate_plot(x, series("ber"), label, "BER", f"BER vs {label}", log2x=log2x)
+            with p2:
+                error_rate_plot(x, series("ser"), label, "SER", f"SER vs {label}",
+                                theory=theory, log2x=log2x)
+            g1, _ = st.columns(2)
+            with g1:
+                error_rate_plot(x, series("goodput"), label, "Goodput [bits / channel use]",
+                                f"Goodput vs {label}", log2x=log2x, logy=False)
+            missing = [f"{le.DETECTORS[d]} at {label} = "
+                       + ", ".join(str(row["value"]) for row in ok if d in row["missing"])
+                       for d in dets if any(d in row["missing"] for row in ok)]
+            if missing:
+                st.info("Not available (left out): " + "; ".join(missing) + ".")
+            st.caption(f"Values at or below {BER_FLOOR:.0e} are drawn at {BER_FLOOR:.0e} "
+                       "(zero observed errors). Goodput = rate × (1 − BER).")
+    with t_data:
+        data = {label: [row["value"] for row in rows],
+                "Simulated": ["yes" if row["ok"] else "no" for row in rows],
+                "Bits per frame": [row.get("bits") for row in rows],
+                "N0": [row.get("N0") for row in rows],
+                "Es/N0 [dB]": [row.get("EsN0_dB") for row in rows],
+                "Eb/N0 [dB]": [row.get("EbN0_dB") for row in rows],
+                "Rate [bits/use]": [row.get("rate") for row in rows]}
+        for d in dets:
+            for metric, name in (("ber", "BER"), ("ser", "SER"), ("goodput", "Goodput")):
+                data[f"{name} {le.DETECTORS[d]}"] = [
+                    row["per_detector"][d][metric]
+                    if row["ok"] and d in row["per_detector"] else None for row in rows]
+        if any(row.get("theory_ser") is not None for row in rows):
+            data["SER theory"] = [row.get("theory_ser") for row in rows]
+        data["Note"] = [row.get("reason", "") for row in rows]
+        st.dataframe(data)
+        st.download_button("Download sweep data (CSV)", to_csv(data),
+                           f"parameter_sweep_{param}.csv", "text/csv")
+    with t_chain:
+        st.caption("Signal chain of the base configuration (before the swept parameter is "
+                   "changed).")
+        signal_chain_view(payload["chain"])
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+payload = st.session_state.get("gl_payload")
+if payload:
+    pcfg = payload["cfg"]
+    st.divider()
+    st.subheader("Results")
+    kind_label = {"point": "Single point", "sweep": "SNR sweep", "param": "Parameter sweep"}
+    st.caption(f"{kind_label[payload['kind']]} · {config_summary(pcfg)} · "
+               f"{payload['n_bits']} bits × {payload['n_frames']} frames · "
+               f"seed {payload['seed'] if payload['seed'] is not None else 'random'} · "
+               f"{payload['elapsed']:.2f} s")
+    current = dataclasses.replace(cfg, detectors=list(cfg.detectors))
+    if current != pcfg:
+        st.info("The configuration in the sidebar has changed since these results were "
+                "computed. Press Run simulation to update them.")
+    if payload["kind"] == "point":
+        results_point(payload)
+    elif payload["kind"] == "sweep":
+        results_snr_sweep(payload)
+    else:
+        results_param_sweep(payload)
