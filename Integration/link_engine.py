@@ -53,7 +53,7 @@ from Channel.OFDMChannel import OFDM as LegacyOFDMLink
 from Receiver.receiver import Receiver, fsk_encode, theory_ser_qam
 
 try:
-    from Channel.AWSN import Alpha_Stable_Channel
+    from Channel.AIndependentSN import Alpha_Stable_Channel
 except ModuleNotFoundError as _exc:          # optional dependency aub_htp
     if _exc.name != "aub_htp":
         raise
